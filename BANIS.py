@@ -201,7 +201,7 @@ def main():
               f"lr{args.learning_rate}_wd{args.weight_decay}_sch{args.scheduler}_syn_{args.synthetic}"
               f"_drop{args.drop_slice_prob}_shift{args.shift_slice_prob}_int{args.intensity_aug}_noise{args.noise_scale}"
               f"_affine{args.affine}_ns{args.n_steps}_ss{args.small_size}"
-    )
+    ) if not args.exp_name else args.exp_name
 
     save_dir = os.path.join(args.save_path, exp_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -243,7 +243,8 @@ def main():
         model=model,
         train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True,
                                      drop_last=True),
-        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers)
+        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers),
+        ckpt_path="last" if args.resume_from_checkpoint else None
     )
 
     print("Training complete")
@@ -297,6 +298,8 @@ def parse_args():
     parser.add_argument("--log_every_n_steps", type=int, default=100, help="Log every n steps.")
     parser.add_argument("--val_check_interval", type=int, default=5000, help="Validation check interval.")
     parser.add_argument("--small_size", type=int, default=128, help="Size of the patches.")
+    parser.add_argument("--resume_from_checkpoint", type=bool, default=False, help="Resume training from the last checkpoint.")
+    parser.add_argument("--exp_name", type=str, default="", help="Experiment name (if empty, will be filled automatically).")
 
     return parser.parse_args()
 
