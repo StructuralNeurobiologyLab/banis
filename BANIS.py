@@ -180,7 +180,7 @@ class BANIS(LightningModule):
 
         for k, v in best_nerl_metrics.items():
             if isinstance(v, (int, float)):
-                self.safe_add_scalar(f"{mode}_best_nerl_{k}", v)
+                self.safe_add_scalar(f"{mode}_best_nerl_{k}", v, global_step)
 
     def safe_add_scalar(self, name: str, value: float, global_step=None) -> None:
         try:  # s.t. full_cube_inference can be called outside of .fit() without error
