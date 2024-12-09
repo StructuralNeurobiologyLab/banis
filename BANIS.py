@@ -28,9 +28,9 @@ class BANIS(LightningModule):
     PyTorch Lightning module for BANIS: Baseline for Affinity-based Neuron Instance Segmentation
     """
 
-    def __init__(self, *args: Any, **kwargs: Any):
+    def __init__(self, **kwargs: Any):
         super().__init__()
-        self.save_hyperparameters(*args, **kwargs)
+        self.save_hyperparameters()
         print(f"hparams: \n{self.hparams}")
 
         self.model = create_mednext_v1(
@@ -102,7 +102,8 @@ class BANIS(LightningModule):
                                          global_step=self.global_step)
 
     def on_validation_epoch_end(self):
-        self.full_cube_inference("val")
+        pass
+        #self.full_cube_inference("val")
 
     def on_train_end(self):
         assert self.best_nerl_so_far["val"] > 0, "No best NERL found in validation"
@@ -115,7 +116,7 @@ class BANIS(LightningModule):
         self.full_cube_inference("train")
 
     @torch.no_grad()
-    def full_cube_inference(self, mode: str):
+    def full_cube_inference(self, mode: str, global_step=None):
         """Perform full cube inference. Expensive!
 
         Args:
@@ -137,9 +138,9 @@ class BANIS(LightningModule):
         aff_pred = zarr.array(aff_pred, dtype=np.float16, store=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr",
                               chunks=(3, 512, 512, 512), overwrite=True)
 
-        self._evaluate_thresholds(aff_pred, os.path.join(seed_path, "skeleton.pkl"), mode)
+        self._evaluate_thresholds(aff_pred, os.path.join(seed_path, "skeleton.pkl"), mode, global_step)
 
-    def _evaluate_thresholds(self, aff_pred: zarr.Array, skel_path: str, mode: str):
+    def _evaluate_thresholds(self, aff_pred: zarr.Array, skel_path: str, mode: str, global_step=None):
         best_voi = best_voi_no_merge = 1e100
         best_nerl = best_nerl_no_merge = -1
         best_nerl_metrics = None
@@ -156,7 +157,7 @@ class BANIS(LightningModule):
 
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
-                    self.safe_add_scalar(f"{mode}_{k}_thr_{thr}", v)
+                    self.safe_add_scalar(f"{mode}_{k}_thr_{thr}", v, global_step)
 
             if metrics["n_non0_mergers"] == 0:
                 best_nerl_no_merge = max(best_nerl_no_merge, metrics["nerl"])
@@ -172,18 +173,18 @@ class BANIS(LightningModule):
                     np.save(f"{self.hparams.save_dir}/pred_seg_best_nerl_{mode}.npy", pred_seg)
             best_voi = min(best_voi, metrics["voi_sum"])
 
-        self.safe_add_scalar(f"{mode}_best_nerl", best_nerl)
-        self.safe_add_scalar(f"{mode}_best_voi", best_voi)
-        self.safe_add_scalar(f"{mode}_best_nerl_no_merge", best_nerl_no_merge)
-        self.safe_add_scalar(f"{mode}_best_voi_no_merge", best_voi_no_merge)
+        self.safe_add_scalar(f"{mode}_best_nerl", best_nerl, global_step)
+        self.safe_add_scalar(f"{mode}_best_voi", best_voi, global_step)
+        self.safe_add_scalar(f"{mode}_best_nerl_no_merge", best_nerl_no_merge, global_step)
+        self.safe_add_scalar(f"{mode}_best_voi_no_merge", best_voi_no_merge, global_step)
 
         for k, v in best_nerl_metrics.items():
             if isinstance(v, (int, float)):
                 self.safe_add_scalar(f"{mode}_best_nerl_{k}", v)
 
-    def safe_add_scalar(self, name: str, value: float) -> None:
+    def safe_add_scalar(self, name: str, value: float, global_step=None) -> None:
         try:  # s.t. full_cube_inference can be called outside of .fit() without error
-            self.logger.experiment.add_scalar(name, value, self.global_step)
+            self.logger.experiment.add_scalar(name, value, self.global_step if global_step is None else global_step)
         except Exception as e:
             print(f"Error logging {name}: {e}")
 
@@ -206,18 +207,25 @@ def main():
     save_dir = os.path.join(args.save_path, exp_name)
     os.makedirs(save_dir, exist_ok=True)
     print(f"save dir: {save_dir}")
-    tb_logger = TensorBoardLogger(save_dir=save_dir)
+    tb_logger = TensorBoardLogger(
+        save_dir=args.save_path,
+        name=exp_name,
+        version="default",
+    )
     tb_logger.experiment.add_text("save dir", save_dir)
 
+    model_checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        save_last=True,
+        mode="min",
+        save_top_k=100,
+        verbose=True,
+        save_on_train_epoch_end=False  # automatically runs at the end of the validation
+    )
     trainer = pl.Trainer(
         callbacks=[
             DeviceStatsMonitor(),
-            ModelCheckpoint(
-                monitor="val_loss",
-                save_last=True,
-                mode="min",
-                save_top_k=100,
-            ),
+            model_checkpoint_callback
         ],
         logger=tb_logger,
         max_steps=args.n_steps,
@@ -232,19 +240,20 @@ def main():
         check_val_every_n_epoch=None,
         num_sanity_val_steps=args.n_debug_steps,
     )
+    print(f"Checkpoints will be saved in: {trainer.default_root_dir}/checkpoints")
 
     train_data, val_data, n_channels = load_data(args)
     args.save_dir = save_dir
     args.num_input_channels = n_channels
 
-    model = BANIS(args)
+    model = BANIS(**vars(args))
 
     trainer.fit(
         model=model,
         train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True,
                                      drop_last=True),
         val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers),
-        ckpt_path="last" if args.resume_from_checkpoint else None
+        ckpt_path="last" if args.resume_from_last_checkpoint else None
     )
 
     print("Training complete")
@@ -298,7 +307,7 @@ def parse_args():
     parser.add_argument("--log_every_n_steps", type=int, default=100, help="Log every n steps.")
     parser.add_argument("--val_check_interval", type=int, default=5000, help="Validation check interval.")
     parser.add_argument("--small_size", type=int, default=128, help="Size of the patches.")
-    parser.add_argument("--resume_from_checkpoint", type=bool, default=False, help="Resume training from the last checkpoint.")
+    parser.add_argument("--resume_from_last_checkpoint", action=argparse.BooleanOptionalAction, default=False, help="Resume training from the last checkpoint.")
     parser.add_argument("--exp_name", type=str, default="", help="Experiment name (if empty, will be filled automatically).")
 
     return parser.parse_args()

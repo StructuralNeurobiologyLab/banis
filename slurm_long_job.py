@@ -17,6 +17,8 @@ if __name__ == "__main__":
         exit(1)
 
     command = f"sbatch --export=ALL,SAVE_DIR={save_dir},LONG_JOB=TRUE --job-name {exp_name} --output {save_dir}/slurm-log.txt aff_train.sh {' '.join(unknown_args)} --save_path {save_path} --exp_name {exp_name}"
+    command_validation = f"sbatch --export=ALL,SAVE_DIR={save_dir},LONG_JOB=TRUE --job-name {exp_name}_val --output {save_dir}/slurm-validation-log.txt validation_watcher.sh {' '.join(unknown_args)} --save_path {save_path} --exp_name {exp_name}"
 
     # Execute the command
     os.system(command)
+    os.system(command_validation)
