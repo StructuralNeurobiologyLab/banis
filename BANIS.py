@@ -102,8 +102,12 @@ class BANIS(LightningModule):
                                          global_step=self.global_step)
 
     def on_validation_epoch_end(self):
-        pass
-        #self.full_cube_inference("val")
+        if self.args.long_training:
+            args = ' '.join([f"--{key} {value}" for key, value in vars(self.hparams).items()])
+            command = f"sbatch --job-name {self.hparams.exp_name}_val --output {self.hparams.save_dir}/slurm-validation-log.txt validation_watcher.sh {args}"
+            os.system(command)
+        else:
+            self.full_cube_inference("val")
 
     def on_train_end(self):
         assert self.best_nerl_so_far["val"] > 0, "No best NERL found in validation"
@@ -309,6 +313,7 @@ def parse_args():
     parser.add_argument("--small_size", type=int, default=128, help="Size of the patches.")
     parser.add_argument("--resume_from_last_checkpoint", action=argparse.BooleanOptionalAction, default=False, help="Resume training from the last checkpoint.")
     parser.add_argument("--exp_name", type=str, default="", help="Experiment name (if empty, will be filled automatically).")
+    parser.add_argument("--long_training", action=argparse.BooleanOptionalAction, default=False, help="Long training with a separate validation process.")
 
     return parser.parse_args()
 
