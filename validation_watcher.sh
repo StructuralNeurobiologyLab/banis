@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=0-5
+#SBATCH --time=7-0
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=500000
 #SBATCH --signal=B:USR1@300
