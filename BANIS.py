@@ -102,10 +102,24 @@ class BANIS(LightningModule):
                                          global_step=self.global_step)
 
     def on_validation_epoch_end(self):
-        if self.args.long_training:
-            args = ' '.join([f"--{key} {value}" for key, value in vars(self.hparams).items()])
+        if self.hparams.long_training:
+            def format_value(value):
+                if isinstance(value, bool):
+                    return str(value).lower()  # Convert booleans to lowercase strings (true/false)
+                elif isinstance(value, list):
+                    return ' '.join(map(str, value))  # Convert list to a space-separated string
+                elif value is None:
+                    return ''  # Skip None values
+                else:
+                    return str(value)  # Convert other types to string
+
+            args_list = [f"--{key} {format_value(value)}" for key, value in self.hparams.items()]
+            args = ' '.join(args_list)
+
             command = f"sbatch --job-name {self.hparams.exp_name}_val --output {self.hparams.save_dir}/slurm-validation-log.txt validation_watcher.sh {args}"
             os.system(command)
+            print(f"running validation: {command}")
+
         else:
             self.full_cube_inference("val")
 
@@ -130,7 +144,7 @@ class BANIS(LightningModule):
         print(f"Full cube inference for {mode}")
 
         base_path_mode = os.path.join(self.hparams.base_data_path, self.hparams.data_setting, mode)
-        seeds_path_mode = sorted([f for f in os.listdir(base_path_mode) if "seed" in f])
+        seeds_path_mode = sorted([f for f in os.listdir(base_path_mode) if f.startswith("seed")])
         assert len(seeds_path_mode) >= 1, f"No seeds found in {base_path_mode}"
         seed_path = os.path.join(base_path_mode, seeds_path_mode[0])
 

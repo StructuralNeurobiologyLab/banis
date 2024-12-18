@@ -20,6 +20,11 @@ def main():
     if os.path.exists(ckpt_path):
         model = BANIS.load_from_checkpoint(ckpt_path)
         model = model.to("cuda")
+        tb_logger = TensorBoardLogger(
+            save_dir=args.save_path,
+            name=args.exp_name,
+            version="default",
+        )
         trainer = pl.Trainer(logger=tb_logger, accelerator="gpu", devices=-1)
         model.trainer = trainer  # for the logger
 
@@ -41,6 +46,7 @@ def parse_args():
     parser.add_argument("--exp_name", type=str, default="", help="Experiment name (if empty, will be filled automatically).")
 
     args, _ = parser.parse_known_args()
+    print(f"args: {args}")
     return args
 
 
