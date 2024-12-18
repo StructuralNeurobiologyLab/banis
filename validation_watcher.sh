@@ -10,4 +10,4 @@
 #SBATCH --open-mode=append
 
 sleep 1m # waits for the checkpoint creation
-srun --gres=gpu:1 mamba run -n nisb --no-capture-output python3 -u validation_watcher.py ${@}
+mamba run -n nisb --no-capture-output python3 -u validation_watcher.py ${@}
