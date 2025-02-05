@@ -67,7 +67,9 @@ class BANIS(LightningModule):
         return self.model(x)
 
     def training_step(self, data: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        return self._step(data, "train")
+        result = self._step(data, "train")
+        torch.cuda.empty_cache()  # sometimes OOM error without this
+        return result
 
     def validation_step(self, data: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         return self._step(data, "val")

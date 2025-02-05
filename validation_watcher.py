@@ -31,6 +31,7 @@ def main():
         # global step of model loaded from checkpoint is 0 by default, until trainer is started
         # see https://github.com/Lightning-AI/pytorch-lightning/issues/12819
         checkpoint = torch.load(ckpt_path)
+        print(f"global step: {checkpoint['global_step']}")
         model.full_cube_inference("val", checkpoint["global_step"])
 
 
