@@ -10,23 +10,40 @@ def load_config(filename):
         return yaml.safe_load(file)
 
 
-def construct_args(params, combination):
+def construct_args(params, combination, variable_keys):
     args = []
+    long = False
+    save_dir = ""
+    exp_name_parts = [params["exp_name"][0]] if "exp_name" in params else []
     for key, value in zip(params.keys(), combination):
-        if key in ["scheduler", "intensity_aug"]:
+        if key in ["scheduler", "intensity_aug", "validate_extern"]:
             if not value:
                 args.append(f"--no-{key}")
+        elif key == "auto_resubmit":
+            long = value
         else:
             args.append(f"--{key} {value}")
-    return " ".join(args)
+            if key == "save_path":
+                save_dir = value
+            if key in variable_keys:
+                exp_name_parts.append(f"{key}{value}")
+    exp_name = "-".join(exp_name_parts) or "experiment"
+    save_dir = os.path.join(save_dir, exp_name)
+    os.makedirs(save_dir, exist_ok=False)
+    return long, save_dir, " ".join(args), exp_name
 
 
 if __name__ == "__main__":
     config = load_config("config.yaml")
     params = config['params']
+    variable_keys = [k for k, v in params.items() if len(v) > 1]
 
     for combination in product(*params.values()):
-        command = f"sbatch aff_train.sh {construct_args(params, combination)}"
+        long, save_dir, args, exp_name = construct_args(params, combination, variable_keys)
+        if not long:
+            command = f"sbatch --output {save_dir}/slurm.out aff_train.sh {args}"
+        else:
+            command = f"sbatch --output {save_dir}/slurm.out --export=ALL,SAVE_DIR={save_dir},LONG_JOB=TRUE,PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True aff_train.sh {args}"
         print(f"Executing command: {command}")
         os.system(command)
         time.sleep(1)

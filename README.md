@@ -36,11 +36,7 @@ To run multiple jobs on Slurm, adjust `config.yaml` and `aff_train.sh`, then:
 python slurm_job_scheduler.py
 ```
 
-To run training that restarts from the last checkpoint once the Slurm limit is reached, adjust `aff_train.sh`, then:
-
-```bash
-python slurm_long_job.py --save_path /local/logging/dir/ --exp_name experiment_name [--other_arguments]
-```
+Adding an `auto_resubmit` argument to `config.yaml` allows Slurm to automatically resubmit jobs that reach the Slurm time limit (see `aff_train.sh`).
 
 ## Evaluation
 

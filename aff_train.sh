@@ -21,8 +21,7 @@ resubmit_job() {
   EXP_NAME=$(echo "${LONG_JOB_ARGS}" | grep -oP '(?<=--exp_name )\S+')
   sbatch --dependency=afterany:${SLURM_JOBID} \
          --export=ALL,RESUME=TRUE,LONG_JOB=TRUE,SAVE_DIR=${SAVE_DIR},LONG_JOB_ARGS="${LONG_JOB_ARGS}" \
-         --output=${SAVE_DIR}/slurm-log.txt \
-         --job-name ${EXP_NAME} \
+         --output=${SAVE_DIR}/slurm.out \
          "$0" "${@}"
   exit 0
 }
