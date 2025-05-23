@@ -18,10 +18,10 @@ if __name__ == "__main__":
             print(f"Error: Experiment already exists: {save_path}/{exp_name}")
             exit(1)
 
-        command = f"sbatch --export=ALL,SAVE_DIR={save_dir},LONG_JOB=TRUE,PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True --job-name {exp_name} --output {save_dir}/slurm-log.txt aff_train.sh {' '.join(unknown_args)}  --long_training --save_path {save_path} --exp_name {exp_name}"
+        command = f"sbatch --export=ALL,SAVE_DIR={save_dir},LONG_JOB=TRUE,PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True --job-name {exp_name} --output {save_dir}/slurm-log.txt aff_train.sh {' '.join(unknown_args)}  --validate_extern --save_path {save_path} --exp_name {exp_name}"
 
     else:
-        command = f"sbatch --export=ALL,RESUME=TRUE,SAVE_DIR={save_dir},LONG_JOB=TRUE,PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,LONG_JOB_ARGS='{' '.join(unknown_args)}  --long_training --save_path {save_path} --exp_name {exp_name}' --job-name {exp_name} --output {save_dir}/slurm-log.txt aff_train.sh {' '.join(unknown_args)}  --long_training --save_path {save_path} --exp_name {exp_name}"
+        command = f"sbatch --export=ALL,RESUME=TRUE,SAVE_DIR={save_dir},LONG_JOB=TRUE,PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,LONG_JOB_ARGS='{' '.join(unknown_args)}  --validate_extern --save_path {save_path} --exp_name {exp_name}' --job-name {exp_name} --output {save_dir}/slurm-log.txt aff_train.sh {' '.join(unknown_args)}  --validate_extern --save_path {save_path} --exp_name {exp_name}"
 
     # Execute the command
     print(command)
