@@ -9,6 +9,7 @@ import numpy as np
 import torch.utils
 import zarr
 from monai.transforms import RandAffined
+from monai.utils import set_determinism
 from torch.utils.data import Dataset, ConcatDataset
 from tqdm import tqdm
 
@@ -110,6 +111,7 @@ class AffinityDataset(Dataset):
             ),
             divide: Union[int, float] = 1,
     ):
+        set_determinism(seed=np.random.randint(0, 2**32))
         self.size_divisor = size_divisor
         self.img = img
         self.divide = divide
@@ -121,7 +123,7 @@ class AffinityDataset(Dataset):
 
         self.offset = tuple((img.shape[i] - seg.shape[i]) // 2 for i in range(3))
 
-        print(f"seg shape {seg.shape}, img shape {img.shape}")
+        # print(f"seg shape {seg.shape}, img shape {img.shape}")
 
         if img.shape[:3] != seg.shape:
             # Shapes don't match, pad seg (and load it into memory)
