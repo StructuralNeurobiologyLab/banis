@@ -19,8 +19,12 @@ def construct_args(params, combination, variable_keys):
         if key in ["scheduler", "intensity_aug", "validate_extern"]:
             if not value:
                 args.append(f"--no-{key}")
+            else:
+                args.append(f"--{key}")
         elif key == "auto_resubmit":
             long = value
+        elif key == "exp_name":
+            pass
         else:
             args.append(f"--{key} {value}")
             if key == "save_path":
@@ -28,8 +32,8 @@ def construct_args(params, combination, variable_keys):
             if key in variable_keys:
                 exp_name_parts.append(f"{key}{value}")
     exp_name = "-".join(exp_name_parts) or "experiment"
+    args.append(f"--exp_name {exp_name}")
     save_dir = os.path.join(save_dir, exp_name)
-    os.makedirs(save_dir, exist_ok=False)
     return long, save_dir, " ".join(args), exp_name
 
 
@@ -40,6 +44,7 @@ if __name__ == "__main__":
 
     for combination in product(*params.values()):
         long, save_dir, args, exp_name = construct_args(params, combination, variable_keys)
+        os.makedirs(save_dir, exist_ok=False)
         if not long:
             command = f"sbatch --output {save_dir}/slurm.out aff_train.sh {args}"
         else:
