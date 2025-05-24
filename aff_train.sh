@@ -38,11 +38,11 @@ if [ -n "$RESUME" ]; then
     echo "Resuming from the last checkpoint"
     echo "LONG_JOB_ARGS: ${LONG_JOB_ARGS}"
     echo "ALL ARGS: ${@}"
-    srun --gres=gpu:1 mamba run -n nisb --no-capture-output python3 -u BANIS.py --resume_from_last_checkpoint ${LONG_JOB_ARGS} &
+    srun mamba run -n nisb --no-capture-output python3 -u BANIS.py --resume_from_last_checkpoint ${LONG_JOB_ARGS} &
 else
     echo "Starting long training from scratch."
     export LONG_JOB_ARGS="${@}"
     echo "LONG_JOB_ARGS: ${LONG_JOB_ARGS}"
-    srun --gres=gpu:1 mamba run -n nisb --no-capture-output python3 -u BANIS.py ${LONG_JOB_ARGS} &
+    srun mamba run -n nisb --no-capture-output python3 -u BANIS.py ${LONG_JOB_ARGS} &
 fi
 wait

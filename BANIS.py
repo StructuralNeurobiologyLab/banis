@@ -1,9 +1,11 @@
 import argparse
 import gc
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict
+import random
 
 import numpy as np
 import pytorch_lightning as pl
@@ -14,6 +16,7 @@ from nnunet_mednext import create_mednext_v1
 from pytorch_lightning import LightningModule, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, DeviceStatsMonitor, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.strategies import DDPStrategy
 from torch.nn.functional import binary_cross_entropy_with_logits
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
