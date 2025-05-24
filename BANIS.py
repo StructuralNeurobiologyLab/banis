@@ -220,6 +220,16 @@ class BANIS(LightningModule):
             print(f"Error logging {name}: {e}")
 
 
+def worker_init_fn(worker_id):
+    """ Ensures different seeds for each worker. """
+    # torch.initial_seed() is derived from the initial seed state but advanced for each worker
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    print(f"[Worker {worker_id}] Seed: {seed}")
+
+
 def main():
     args = parse_args()
     seed_everything(args.seed, workers=True)
@@ -285,8 +295,8 @@ def main():
     trainer.fit(
         model=model,
         train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True,
-                                     drop_last=True),
-        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers),
+                                     drop_last=True, worker_init_fn=worker_init_fn),
+        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers, worker_init_fn=worker_init_fn),
         ckpt_path="last" if args.resume_from_last_checkpoint else None
     )
 
