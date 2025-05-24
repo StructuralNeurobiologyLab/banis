@@ -275,6 +275,8 @@ def main():
         max_steps=args.n_steps,
         accelerator="gpu",
         devices=args.devices,
+        strategy=DDPStrategy(find_unused_parameters=False) if args.distributed else "auto",
+        num_nodes=int(os.environ["SLURM_NNODES"]) if args.distributed else 1,
         log_every_n_steps=args.log_every_n_steps,
         limit_val_batches=100,
         precision="16-mixed",
@@ -324,6 +326,7 @@ def parse_args():
     parser.add_argument("--val_check_interval", type=int, default=5000, help="Validation check interval.")
     parser.add_argument("--resume_from_last_checkpoint", action=argparse.BooleanOptionalAction, default=False, help="Resume training from the last checkpoint.")
     parser.add_argument("--validate_extern", action=argparse.BooleanOptionalAction, default=False, help="Long training with a separate validation process.")
+    parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=False, help="Use distributed training.")
 
     # Data arguments
     parser.add_argument("--base_data_path", type=str, default="/cajal/nvmescratch/projects/NISB/", help="Base path for the dataset.")
