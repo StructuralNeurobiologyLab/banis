@@ -13,6 +13,7 @@ import torch
 import torchvision
 import zarr
 from nnunet_mednext import create_mednext_v1
+from nnunet_mednext import MedNeXtBlock, MedNeXtUpBlock, MedNeXtDownBlock
 from pytorch_lightning import LightningModule, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, DeviceStatsMonitor, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -85,6 +86,8 @@ class BANIS(LightningModule):
         return self._step(data, "val")
 
     def _step(self, data: Dict[str, torch.Tensor], mode: str) -> torch.Tensor:
+        self.log_input(data["img"])
+        self.log_weight_stats()
         pred = self(data["img"])
         target = data["aff"].half()
         loss_mask = data["aff"] >= 0
@@ -222,6 +225,65 @@ class BANIS(LightningModule):
         except Exception as e:
             print(f"Error logging {name}: {e}")
 
+    def log_input(self, input):
+        self.log_dict({
+                f"input/min": input.min(),
+                f"input/max": input.max(),
+                f"input/mean": input.mean(),
+                f"input/std": input.std(),
+        })
+
+    def register_activation_hooks(self):
+        for name, module in self.named_modules():
+            if isinstance(module, (MedNeXtUpBlock, MedNeXtDownBlock)):
+                def hook_fn(module, input, output, block_name=name):  # capture name in default arg
+                    if not self.training:  # don't log during validation
+                        return
+                    self.log_dict({
+                        f"activations/{block_name}_min": output.min(),
+                        f"activations/{block_name}_max": output.max(),
+                        f"activations/{block_name}_mean": output.mean(),
+                        f"activations/{block_name}_std": output.std(),
+                    })
+                    if torch.isnan(output).any():
+                        print(f"NaN in output of {block_name}")
+                module.register_forward_hook(hook_fn)
+
+    def setup(self, stage: str):
+        if stage == 'fit':
+            self.register_activation_hooks()
+
+    def log_weight_stats(self):
+        for name, param in self.named_parameters():
+            self.log_dict({
+                f"weights/{name}_min": param.data.min(),
+                f"weights/{name}_max": param.data.max(),
+                f"weights/{name}_mean": param.data.mean(),
+                f"weights/{name}_std": param.data.std(),
+            })
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm):
+        total_norm_before = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
+        self.log("gradients/total_norm", total_norm_before.item())
+        max_grad_before = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
+        self.log("gradients/max_grad", max_grad_before)
+
+        for p in self.parameters():
+            if p.grad is not None:
+                p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e4, neginf=-1e4)
+        total_norm2 = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
+        self.log("gradients/clamped_total_norm", total_norm2.item())
+        max_grad2 = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
+        self.log("gradients/clamped_max_grad", max_grad2)
+
+        self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
+
+        total_norm_after = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
+        self.log("clipped_gradients/total_norm", total_norm_after.item(), on_step=True)
+        max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
+        self.log("clipped_gradients/max_grad", max_grad_after)
+
+
 
 def worker_init_fn(worker_id):
     """ Ensures different seeds for each worker. """
@@ -288,6 +350,7 @@ def main():
         val_check_interval=args.val_check_interval,  # validation full cube inference expensive so less frequent
         check_val_every_n_epoch=None,
         num_sanity_val_steps=args.n_debug_steps,
+        gradient_clip_val=1.0,
     )
     print(f"Checkpoints will be saved in: {trainer.default_root_dir}/checkpoints")
 
@@ -295,7 +358,14 @@ def main():
     args.save_dir = save_dir
     args.num_input_channels = n_channels
 
-    model = BANIS(**vars(args))
+    if os.path.exists(args.model_from_checkpoint):
+        print(f"Loading model from checkpoint: {args.model_from_checkpoint}")
+        model = BANIS(**vars(args))
+        checkpoint = torch.load(args.model_from_checkpoint, map_location="cpu")
+        model.load_state_dict(checkpoint["state_dict"])
+        model.hparams.update(vars(args))
+    else:
+        model = BANIS(**vars(args))
 
     trainer.fit(
         model=model,
@@ -328,6 +398,7 @@ def parse_args():
     parser.add_argument("--log_every_n_steps", type=int, default=100, help="Log every n steps.")
     parser.add_argument("--val_check_interval", type=int, default=5000, help="Validation check interval.")
     parser.add_argument("--resume_from_last_checkpoint", action=argparse.BooleanOptionalAction, default=False, help="Resume training from the last checkpoint.")
+    parser.add_argument("--model_from_checkpoint", type=str, default="", help="Load model from defined checkpoint.")
     parser.add_argument("--validate_extern", action=argparse.BooleanOptionalAction, default=False, help="Long training with a separate validation process.")
     parser.add_argument("--distributed", action=argparse.BooleanOptionalAction, default=False, help="Use distributed training.")
 
@@ -336,6 +407,7 @@ def parse_args():
     parser.add_argument("--data_setting", type=str, default="base", help="Data setting identifier.")
     parser.add_argument("--real_data_path", type=str, default="/cajal/scratch/projects/misc/mdraw/data/funke/zebrafinch/training/", help="Path to the real dataset. See https://colab.research.google.com/github/funkelab/lsd/blob/master/lsd/tutorial/notebooks/lsd_data_download.ipynb ")
     parser.add_argument("--synthetic", type=float, default=1.0, help="Ratio of synthetic data to real data.")
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Use augmentations")
     parser.add_argument("--drop_slice_prob", type=float, default=0.05, help="Probability of dropping a slice during augmentation.")
     parser.add_argument("--shift_slice_prob", type=float, default=0.05, help="Probability of shifting a slice during augmentation.")
     parser.add_argument("--intensity_aug", action=argparse.BooleanOptionalAction, default=True, help="Whether to apply intensity augmentation.")

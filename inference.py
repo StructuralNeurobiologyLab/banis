@@ -3,7 +3,6 @@ from typing import Union, List, Tuple
 
 import numba
 import numpy as np
-import psutil
 import torch
 import torch.utils
 import zarr

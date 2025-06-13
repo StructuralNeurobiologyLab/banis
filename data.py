@@ -309,6 +309,7 @@ def get_seg_dataset(
         data_path: str,
         len_multiplier: int = 10,
         small_size: int = 128,
+        augment = False,
         augment_args: Namespace = Namespace(
             drop_slice_prob=0,
             shift_slice_prob=0,
@@ -343,7 +344,7 @@ def get_seg_dataset(
             seg=seg.astype(np.int64),
             img=(img / 255).astype(np.float16),
             # divide = 255
-            augment=True,
+            augment=augment,
             len_multiplier=len_multiplier,
             augment_args=augment_args,
             long_range=augment_args.long_range,
@@ -371,6 +372,7 @@ def get_train_data(args: argparse.Namespace):
             args.real_data_path,
             small_size=args.small_size,
             len_multiplier=100,
+            augment=args.augment,
             augment_args=args,
         )
     if args.synthetic > 0:
@@ -412,7 +414,7 @@ def get_syn_train_data(args: argparse.Namespace):
             seg=img_seg["seg"],
             img=img_seg["img"],
             long_range=args.long_range,
-            augment=True,
+            augment=args.augment,
             augment_args=args,
             divide=255.0,
             small_size=args.small_size,

@@ -16,7 +16,7 @@ def construct_args(params, combination, variable_keys):
     save_dir = ""
     exp_name_parts = [params["exp_name"][0]] if "exp_name" in params else []
     for key, value in zip(params.keys(), combination):
-        if key in ["scheduler", "intensity_aug", "validate_extern", "distributed", "compile", "resume_from_last_checkpoint"]:
+        if key in ["scheduler", "intensity_aug", "validate_extern", "distributed", "compile", "resume_from_last_checkpoint", "augment"]:
             if not value:
                 args.append(f"--no-{key}")
             else:
