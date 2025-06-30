@@ -268,31 +268,12 @@ class BANIS(LightningModule):
         max_grad_before = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
         self.log("gradients/max_grad", max_grad_before)
 
-        for p in self.parameters():
-            if p.grad is not None:
-                p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e4, neginf=-1e4)
-        total_norm2 = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("gradients/clamped_total_norm", total_norm2.item())
-        max_grad2 = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("gradients/clamped_max_grad", max_grad2)
-
         self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
 
         total_norm_after = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
         self.log("clipped_gradients/total_norm", total_norm_after.item(), on_step=True)
         max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
         self.log("clipped_gradients/max_grad", max_grad_after)
-
-
-
-def worker_init_fn(worker_id):
-    """ Ensures different seeds for each worker. """
-    # torch.initial_seed() is derived from the initial seed state but advanced for each worker
-    seed = torch.initial_seed() % (2**32)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    print(f"[Worker {worker_id}] Seed: {seed}")
 
 
 def main():
@@ -369,9 +350,8 @@ def main():
 
     trainer.fit(
         model=model,
-        train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True,
-                                     drop_last=True, worker_init_fn=worker_init_fn),
-        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers, worker_init_fn=worker_init_fn),
+        train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True, drop_last=True),
+        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers),
         ckpt_path="last" if args.resume_from_last_checkpoint else None
     )
 
