@@ -22,6 +22,8 @@ from torch.nn.functional import binary_cross_entropy_with_logits
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torchvision.utils import save_image
+import torch.distributed as dist
 
 from data import load_data
 from inference import scale_sigmoid, patched_inference, compute_connected_component_segmentation
@@ -52,6 +54,10 @@ class BANIS(LightningModule):
         self.best_nerl_so_far = defaultdict(float)  # for train/val/test
         self.best_thr_so_far = defaultdict(float)
 
+        self.broken = False  # debug: mark the first time the model breaks
+        self.saved_input = None
+        self.saved_batch_idx = None
+
     def on_save_checkpoint(self, checkpoint):
         checkpoint["best_thr_so_far"] = self.best_thr_so_far
         checkpoint["best_nerl_so_far"] = self.best_nerl_so_far
@@ -80,12 +86,12 @@ class BANIS(LightningModule):
         return self.model(x)
 
     def training_step(self, data: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        return self._step(data, "train")
+        return self._step(data, "train", batch_idx)
 
     def validation_step(self, data: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        return self._step(data, "val")
+        return self._step(data, "val", batch_idx)
 
-    def _step(self, data: Dict[str, torch.Tensor], mode: str) -> torch.Tensor:
+    def _step(self, data: Dict[str, torch.Tensor], mode: str, batch_idx) -> torch.Tensor:
         self.log_input(data["img"])
         self.log_weight_stats()
         pred = self(data["img"])
@@ -96,6 +102,11 @@ class BANIS(LightningModule):
         if not self.plotted:
             self._log_images(data, pred, mode)
             self.plotted = True
+
+        if not self.broken:
+            self.saved_input = data
+            self.saved_batch_idx = batch_idx
+
         return loss
 
     def _log_images(self, data: Dict[str, torch.Tensor], pred: torch.Tensor, mode: str):
@@ -225,6 +236,41 @@ class BANIS(LightningModule):
         except Exception as e:
             print(f"Error logging {name}: {e}")
 
+    # DEBUG: LOG NaN values (for p240)
+    def register_nan_hooks(self):
+        def forward_hook(name):
+            def hook(module, input, output):
+                if not torch.isfinite(output).all():
+                    print(f"[FORWARD NaN] {name}: output has NaNs/Infs")
+                else:
+                    max_val = output.max().item()
+                    min_val = output.min().item()
+                    std_val = output.std().item()
+                    if max_val > 1e4 or std_val > 1e3:
+                        print(f"[FORWARD WARNING] {name}: min={min_val:.2e}, max={max_val:.2e}, std={std_val:.2e}")
+                    else:
+                        print(f"FORWARD {name} OK: min={min_val:.2e}, max={max_val:.2e}, std={std_val:.2e}")
+            return hook
+        def backward_hook(name):
+            def hook(module, grad_input, grad_output):
+                for i, grad in enumerate(grad_input):
+                    if grad is not None and not torch.isfinite(grad).all():
+                        print(f"[BACKWARD NaN] {name} grad_input[{i}] has NaNs/Infs")
+                    elif grad is not None:
+                        max_val = grad.max().item()
+                        min_val = grad.min().item()
+                        std_val = grad.std().item()
+                        print(f"BACKWARD {name} OK: min={min_val:.2e}, max={max_val:.2e}, std={std_val:.2e}")
+                    else:
+                        print(f"BACKWARD {name} is None")
+            return hook
+        for name, module in self.named_modules():
+            #if isinstance(module, (torch.nn.Conv3d, torch.nn.BatchNorm3d, torch.nn.GroupNorm, torch.nn.ReLU, MedNeXtUpBlock, MedNeXtDownBlock)):
+            #if isinstance(module, (MedNeXtUpBlock, MedNeXtDownBlock)):
+            module.register_forward_hook(forward_hook(name))
+            module.register_full_backward_hook(backward_hook(name))  # use full_backward_hook for PyTorch >=1.9
+
+
     def log_input(self, input):
         self.log_dict({
                 f"input/min": input.min(),
@@ -252,6 +298,7 @@ class BANIS(LightningModule):
     def setup(self, stage: str):
         if stage == 'fit':
             self.register_activation_hooks()
+            # self.register_nan_hooks()
 
     def log_weight_stats(self):
         for name, param in self.named_parameters():
@@ -268,13 +315,51 @@ class BANIS(LightningModule):
         max_grad_before = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
         self.log("gradients/max_grad", max_grad_before)
 
-        for p in self.parameters():
-            if p.grad is not None:
-                p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e4, neginf=-1e4)
-        total_norm2 = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("gradients/clamped_total_norm", total_norm2.item())
-        max_grad2 = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("gradients/clamped_max_grad", max_grad2)
+        if not torch.isfinite(torch.cat([p.grad.view(-1) for p in self.parameters() if p.grad is not None])).all():
+            if not self.broken:
+                all_grads = torch.cat([p.grad.view(-1) for p in self.parameters() if p.grad is not None])
+                non_finite_mask = ~torch.isfinite(all_grads)
+                num_non_finite = non_finite_mask.sum().item()
+
+                print(f"ERROR: {num_non_finite}/{len(all_grads)} GRADIENTS INFINITE OR NAN at batch {self.saved_batch_idx}")
+                print("LOGGING INPUT IMAGES...")
+
+                def save(tensor, name):
+                    base_name = f"{self.current_epoch}_{self.global_step:05d}_{self.global_rank}_{name}"
+                    save_image(tensor, os.path.join(self.hparams.save_dir, base_name + ".png"), normalize=True)
+
+                data = self.saved_input
+                middle = data["img"].shape[2] // 2
+                save(data["img"][:, :3, middle], f"img")
+                save(data["img"][:, :3, :, middle], f"img_alt")
+                base_name = f"{self.current_epoch}_{self.global_step:05d}_{self.global_rank}_img"
+                zarr.save(os.path.join(self.hparams.save_dir, base_name + ".zarr"), data["img"][0, :3].cpu().numpy().astype(np.float32))
+                #save(data["aff"][:, :3, middle].detach().to(torch.float16).cpu(), f"aff")
+                #save(data["aff"][:, 3:, middle].detach().to(torch.float16).cpu(), f"lr_aff")
+
+                # Save colored segmentation
+                def get_colormap(seed=42, size=10):
+                    gen = torch.Generator().manual_seed(seed)
+                    return torch.rand(size, 3, generator=gen)
+
+                seg_middle = data["seg"][:, middle]
+                colormap = get_colormap(size=seg_middle.max().item() + 1)
+                colormap[0] = 0  # Background = black
+                colored_seg = colormap[seg_middle.cpu()].permute(0, 3, 1, 2)
+                seg_grid = torchvision.utils.make_grid(colored_seg, value_range=(0, 1))
+                save(seg_grid, "seg")
+                seg_middle = data["seg"][:, :, middle]
+                colormap = get_colormap(size=seg_middle.max().item() + 1)
+                colormap[0] = 0  # Background = black
+                colored_seg = colormap[seg_middle.cpu()].permute(0, 3, 1, 2)
+                seg_grid = torchvision.utils.make_grid(colored_seg, value_range=(0, 1))
+                save(seg_grid, "seg_alt")
+                base_name = f"{self.current_epoch}_{self.global_step:05d}_{self.global_rank}_seg"
+                zarr.save(os.path.join(self.hparams.save_dir, base_name + ".zarr"), data["seg"][0].cpu().numpy().astype(np.int64))
+
+                self.broken = False
+
+
 
         self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
 
@@ -282,17 +367,6 @@ class BANIS(LightningModule):
         self.log("clipped_gradients/total_norm", total_norm_after.item(), on_step=True)
         max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
         self.log("clipped_gradients/max_grad", max_grad_after)
-
-
-
-def worker_init_fn(worker_id):
-    """ Ensures different seeds for each worker. """
-    # torch.initial_seed() is derived from the initial seed state but advanced for each worker
-    seed = torch.initial_seed() % (2**32)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    print(f"[Worker {worker_id}] Seed: {seed}")
 
 
 def main():
@@ -369,9 +443,8 @@ def main():
 
     trainer.fit(
         model=model,
-        train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True,
-                                     drop_last=True, worker_init_fn=worker_init_fn),
-        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers, worker_init_fn=worker_init_fn),
+        train_dataloaders=DataLoader(train_data, batch_size=args.batch_size, num_workers=args.workers, shuffle=True, drop_last=True),
+        val_dataloaders=DataLoader(val_data, batch_size=args.batch_size, num_workers=args.workers),
         ckpt_path="last" if args.resume_from_last_checkpoint else None
     )
 

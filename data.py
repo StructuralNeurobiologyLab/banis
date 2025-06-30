@@ -12,6 +12,8 @@ from monai.transforms import RandAffined
 from monai.utils import set_determinism
 from torch.utils.data import Dataset, ConcatDataset
 from tqdm import tqdm
+from torch.utils.data import get_worker_info
+import torch.distributed as dist
 
 
 def comp_affinities(
@@ -149,8 +151,14 @@ class AffinityDataset(Dataset):
 
     def __getitem__(self, item):
         pos = [_sample_position(o, self.size, self.size_divisor, s) for o, s in zip(self.offset, self.seg.shape)]
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else -1
+        rank = dist.get_rank() if dist.is_initialized() else -1
+        #pos = [100+worker_id, 0, 100+rank]
         slices = tuple(slice(p, p + self.size + self.long_range) for p in pos)
         # Easiest for affine augmentation: all dimensions same
+        #print(f"rank {rank} worker {worker_id} pos: {pos}")
+        #print(f"slices: {slices}")
 
         img = np.moveaxis(self.img[slices] / self.divide, -1, 0)
         assert len(img.shape) == 4

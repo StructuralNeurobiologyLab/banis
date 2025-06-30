@@ -1,14 +1,14 @@
 #!/bin/bash -l
 
-#SBATCH --nodes=2
-#SBATCH --gres=gpu:4
-#SBATCH --ntasks-per-node=4
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks-per-node=1
 #SBATCH --time=7-00
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=1000G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=500G
 #SBATCH --signal=B:USR1@300
 #SBATCH --open-mode=append
-#SBATCH --partition=p.large
+#SBATCH --partition=p.cajal
 
 mamba activate nisb
 

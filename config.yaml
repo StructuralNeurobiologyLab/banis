@@ -5,19 +5,28 @@ params:
     - 1e-2
   seed:
     - 0
-    #- 1
-    #- 2
-    #- 3
-    #- 4
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
   long_range:
     - 10
   batch_size:
     - 1
+    - 8
   scheduler:
-    - true
+    - False
   model_id:
+    #- "S"
+    #- "B"
     - "L"
   kernel_size:
+    #- 3
     - 5
   synthetic:
     - 1.0
@@ -34,7 +43,23 @@ params:
   n_steps:
     - 1_000_000
   small_size:
-    - 256
+    #- 112
+    - 128
+    #- 144
+    #- 160
+    #- 176
+    #- 192
+    #- 208
+    - 224
+    #- 240
+    #- 256
+    #- 272
+    #- 288
+    #- 304
+    #- 320
+    #- 336
+    #- 352
+    #- 368
   data_setting:
     #- "base"
     #- "liconn"
@@ -48,17 +73,18 @@ params:
   base_data_path:
     - "/cajal/nvmescratch/projects/NISB/"
   save_path:
-    #- "/cajal/scratch/projects/misc/riegerfr/aff_nis/"
-    - "/cajal/scratch/projects/misc/zuzur/xl_banis"
+    - "/cajal/scratch/projects/misc/zuzur/ss3"
   exp_name:
-    - "xl_test"
+    - "debug1GPU"
   real_data_path: #https://colab.research.google.com/github/funkelab/lsd/blob/master/lsd/tutorial/notebooks/lsd_data_download.ipynb
     - "/cajal/scratch/projects/misc/mdraw/data/funke/zebrafinch/training/"
   auto_resubmit:
-    - True
+    - False
   distributed:
     - True
   compile:
     - False
   validate_extern:
     - True
+  augment:
+    - False
