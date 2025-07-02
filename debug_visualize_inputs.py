@@ -86,9 +86,10 @@ def create_viewer(base_path: str, port: int) -> Viewer:
     viewer = Viewer()
 
     with viewer.txn() as s:
-        for i in range(8):
+        for i in range(1):
             seg = da.from_zarr(args.input + f"_{i}_seg.zarr").astype(np.uint32)
             img = da.from_zarr(args.input + f"_{i}_img.zarr")
+            img = da.moveaxis(img, 0, -1)
             skels = networkx.Graph()
 
             coord_space = COORDS["standard_c"]
@@ -107,7 +108,7 @@ if __name__ == "__main__":
     parser.add_argument("--base_path", type=str, default="/cajal/nvmescratch/projects/NISB/",
                         help="Base path for NISB data")
     parser.add_argument("--input", type=str,
-                        default="/cajal/scratch/projects/misc/zuzur/ss3/samplingPosColors-seed0/0_00087")
+                        default="/cajal/scratch/projects/misc/zuzur/ss3/debug1GPU-seed0-batch_size1-small_size128/0_63566")
     parser.add_argument("--port", type=int, default=8085, help="Port to run the viewer")
     args = parser.parse_args()
 

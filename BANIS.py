@@ -57,6 +57,7 @@ class BANIS(LightningModule):
         self.broken = False  # debug: mark the first time the model breaks
         self.saved_input = None
         self.saved_batch_idx = None
+        self.broken_info = ""
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["best_thr_so_far"] = self.best_thr_so_far
@@ -97,7 +98,28 @@ class BANIS(LightningModule):
         pred = self(data["img"])
         target = data["aff"].half()
         loss_mask = data["aff"] >= 0
+
+        assert torch.isfinite(pred[loss_mask]).all(), "NaN or Inf in pred"
+        assert torch.isfinite(target[loss_mask]).all(), "NaN or Inf in target"
+        assert loss_mask.sum() > 0, "Empty loss mask"
+        assert (0 <= target[loss_mask]).all() and (target[loss_mask] <= 1).all(), "Invalid target"
+
+        print("Masked pred stats:", pred[loss_mask].min().item(), pred[loss_mask].max().item())
+        print("Masked target stats:", target[loss_mask].min().item(), target[loss_mask].max().item())
+        print("Loss mask count:", loss_mask.sum().item())
+
         loss = binary_cross_entropy_with_logits(pred[loss_mask], target[loss_mask])
+
+        if not torch.isfinite(loss):
+            print("❌ Non-finite loss detected!")
+            print("Loss value:", loss.item())
+            print("Pred stats:", pred[loss_mask].min().item(), pred[loss_mask].max().item())
+            print("Target stats:", target[loss_mask].min().item(), target[loss_mask].max().item())
+            print("Loss mask sum:", loss_mask.sum().item())
+            raise ValueError("NaN or Inf in loss!")
+        else:
+            print("Loss value:", loss.item())
+
         self.log(f"{mode}_loss", loss)
         if not self.plotted:
             self._log_images(data, pred, mode)

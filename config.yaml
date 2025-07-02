@@ -6,19 +6,19 @@ params:
   seed:
     - 0
     - 1
-    - 2
-    - 3
-    - 4
+    #- 2
+    #- 3
+    #- 4
     - 5
-    - 6
-    - 7
-    - 8
-    - 9
+    #- 6
+    #- 7
+    #- 8
+    #- 9
   long_range:
     - 10
   batch_size:
     - 1
-    - 8
+    #- 8
   scheduler:
     - False
   model_id:
@@ -50,7 +50,7 @@ params:
     #- 176
     #- 192
     #- 208
-    - 224
+    #- 224
     #- 240
     #- 256
     #- 272
@@ -75,7 +75,7 @@ params:
   save_path:
     - "/cajal/scratch/projects/misc/zuzur/ss3"
   exp_name:
-    - "debug1GPU"
+    - "debug1GPU_logloss"
   real_data_path: #https://colab.research.google.com/github/funkelab/lsd/blob/master/lsd/tutorial/notebooks/lsd_data_download.ipynb
     - "/cajal/scratch/projects/misc/mdraw/data/funke/zebrafinch/training/"
   auto_resubmit:
