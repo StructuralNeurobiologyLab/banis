@@ -34,7 +34,7 @@ params:
   n_steps:
     - 1_000_000
   small_size:
-    - 256
+    - 128
   data_setting:
     #- "base"
     #- "liconn"
@@ -57,8 +57,10 @@ params:
   auto_resubmit:
     - True
   distributed:
-    - True
+    - False
   compile:
     - False
   validate_extern:
     - True
+  augment:
+    - False
