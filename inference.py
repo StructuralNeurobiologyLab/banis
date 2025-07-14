@@ -1,4 +1,9 @@
 import gc
+import os
+import shutil
+import time
+from collections import defaultdict
+from datetime import timedelta
 from typing import Union, List, Tuple
 
 import numba
@@ -6,16 +11,32 @@ import numpy as np
 import torch
 import torch.utils
 import zarr
+import dask
+from dask.distributed import (Client, LocalCluster)
+import dask.array as da
+from filelock import FileLock
 from numba import jit
 from scipy.ndimage import distance_transform_cdt
 from torch import autocast
 from torch.nn.functional import sigmoid
 from tqdm import tqdm
+from tqdm.dask import TqdmCallback
 
 
 def scale_sigmoid(x: torch.Tensor) -> torch.Tensor:
     """Scale sigmoid to avoid numerical issues in high confidence fp16."""
     return sigmoid(0.2 * x)
+
+def timing(func):
+    def wrapper(*args, **kwargs):
+        print(f"Starting '{func.__name__}'...")
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        elapsed = timedelta(seconds=end - start)
+        print(f"Finished '{func.__name__}' in {elapsed}")
+        return result
+    return wrapper
 
 
 @jit(nopython=True)
@@ -67,6 +88,7 @@ def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray
 
 @torch.no_grad()
 @autocast(device_type="cuda")
+@timing
 def patched_inference(
         img: Union[np.ndarray, zarr.Array],
         model: torch.nn.Module,
@@ -91,8 +113,7 @@ def patched_inference(
     Returns:
         The full prediction. Shape: (channel, x, y, z).
     """
-    print(
-        f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
+    print(f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
     img = img[:]  # load into memory (expensive!)
 
     patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
@@ -197,3 +218,164 @@ def get_single_pred_weight(do_overlap: bool, small_size: int) -> Union[np.ndarra
         return distance_transform_cdt(pred_weight_helper).astype(np.float32)[1:-1, 1:-1, 1:-1]
     else:
         return None
+
+
+@torch.no_grad()
+@autocast(device_type="cuda")
+@timing
+def predict_aff(
+        img: Union[np.ndarray, zarr.Array],
+        model: torch.nn.Module,
+        zarr_path: str = "data.zarr",
+        small_size: int = 128,
+        do_overlap: bool = True,
+        prediction_channels: int = 6,
+        divide: int = 1,
+        chunk_cube_size: int = 1024
+):
+    """
+    Perform patched affinity prediction with a model on an image.
+
+    Args:
+        img: The input image. Shape: (x, y, z, channel).
+        model: The model to use for predictions.
+        small_size: The size of the patches. Defaults to 128.
+        do_overlap: Whether to perform overlapping predictions. Defaults to True:
+            half of patch size for all 3 axes.
+        prediction_channels: The number of channels in the output (additional model output
+            dimensions are discarded). Defaults to 6 (3 short + 3 long range affinities).
+        divide: The divisor for the image. Typically, 1 or 255 if img in [0, 255]
+        chunk_cube_size: The maximal side length of a cube held in memory.
+
+    Returns:
+        The full prediction. Shape: (channel, x, y, z).
+    """
+    print(f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
+
+    all_patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
+    chunked_patch_coordinates = chunk_xyzs(all_patch_coordinates, chunk_cube_size)
+
+    z = zarr.open_group(zarr_path, mode='w')
+    z.create_dataset('sum_pred', shape=(prediction_channels, *img.shape[:3]), chunks=(1, chunk_cube_size), dtype='f4')
+    z.create_dataset('sum_weight', shape=(1, *img.shape[:3]), chunks=(1, chunk_cube_size), dtype='f4')
+
+    # TODO: parallelize this!!!!!!!!!!!!!
+    cluster = LocalCluster(n_workers=4, threads_per_worker=1)
+    client = Client(cluster)
+    print("Dask Client Dashboard:", client.dashboard_link)
+
+    tasks = [dask.delayed(predict_aff_patches_chunked)(chunk, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide)
+                for chunk in chunked_patch_coordinates
+            ]
+    with TqdmCallback(desc="Overall Dask Progress (chunks)", unit="chunk", total=len(tasks)) as pbar:
+        dask.compute(*tasks)
+    #for chunk in tqdm(chunked_patch_coordinates):
+    #    predict_aff_patches_chunked(chunk, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide)
+
+    tmp_sum_pred = da.from_zarr(f"{zarr_path}/sum_pred")
+    tmp_sum_weight = da.from_zarr(f"{zarr_path}/sum_weight")
+    aff = tmp_sum_pred / tmp_sum_weight
+    aff.to_zarr(f"{zarr_path}/aff", overwrite=True)
+
+    for key in ['sum_pred', 'sum_weight']:
+        path = os.path.join(zarr_path, key)
+        if os.path.exists(path):
+            shutil.rmtree(path)
+
+    return zarr.open(f"{zarr_path}/aff", mode="r")
+
+
+def chunk_xyzs(xyzs, chunk_cube_size=1024):
+    """
+    Chunks the patch coordinates into chunks containing coordinates from the same part of the big cube.
+    Args:
+        xyzs: list of all coordinates
+        chunk_cube_size: side length of each chunk
+    Returns:
+        chunked coordinates
+    """
+    chunks = defaultdict(list)
+    for x, y, z in xyzs:
+        chunks[(x // chunk_cube_size, y // chunk_cube_size, z // chunk_cube_size)].append((x, y, z))
+    return list(chunks.values())
+
+
+@torch.no_grad()
+@autocast(device_type="cuda")
+def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide):
+    """
+    Patch-wise predicts affinities in-memory, using coordinates of all patches inside a chunk.
+    Args:
+        patch_coordinates: List of patch coordinates. The extension of the coordinates must fit in memory (use adequate chunk size).
+    Returns:
+        Affinity prediction of the input chunk.
+    """
+    max_x = max(x for x, y, z in patch_coordinates)
+    max_y = max(y for x, y, z in patch_coordinates)
+    max_z = max(z for x, y, z in patch_coordinates)
+    min_x = min(x for x, y, z in patch_coordinates)
+    min_y = min(y for x, y, z in patch_coordinates)
+    min_z = min(z for x, y, z in patch_coordinates)
+
+    img_tmp = img[
+             min_x: max_x + small_size,
+             min_y: max_y + small_size,
+             min_z: max_z + small_size,
+             ]
+    pred_tmp = np.zeros((prediction_channels, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
+    weight_tmp = np.zeros((1, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
+    single_pred_weight = get_single_pred_weight(do_overlap, small_size)
+
+    for x_global, y_global, z_global in patch_coordinates:
+        x = x_global - min_x
+        y = y_global - min_y
+        z = z_global - min_z
+        img_patch = torch.tensor(np.moveaxis(
+            img_tmp[x: x + small_size, y: y + small_size, z: z + small_size],
+            -1, 0)[None]).to(model.device) / divide
+        pred = scale_sigmoid(model(img_patch))[0, :prediction_channels]
+
+        weight_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += single_pred_weight if do_overlap else 1
+        pred_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += pred.detach().cpu().numpy() * (single_pred_weight[None] if do_overlap else 1)
+
+
+    z = zarr.open_group(zarr_path, mode='a')
+    weight_mask = z['sum_weight']
+    full_pred = z['sum_pred']
+
+    with FileLock(f"{zarr_path}/sum_weight.lock"):
+        weight_mask[
+            :,
+            min_x: max_x + small_size,
+            min_y: max_y + small_size,
+            min_z: max_z + small_size,
+        ] += weight_tmp
+
+    with FileLock(f"{zarr_path}/sum_pred.lock"):
+        full_pred[
+            :,
+            min_x: max_x + small_size,
+            min_y: max_y + small_size,
+            min_z: max_z + small_size,
+        ] += pred_tmp
+
+
+
+if __name__ == "__main__":
+    input_path = "/cajal/nvmescratch/projects/NISB/base/val/seed100/data.zarr"
+    img_data = zarr.open(input_path, mode="r")["img"]
+
+    model_path = "/cajal/scratch/projects/misc/zuzur/ss3/debug1GPU-seed0-batch_size1-small_size128/default/checkpoints/epoch=0-step=70000.ckpt"
+    from BANIS import BANIS
+    model = BANIS.load_from_checkpoint(model_path)
+
+    #aff_pred = patched_inference(img_data, model=model, do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
+    #store = zarr.DirectoryStore('/cajal/scratch/projects/misc/zuzur/test0.zarr')
+    #store.rmdir('')
+    #z = zarr.array(aff_pred, store=store, override=True)
+
+    #aff_pred2 = predict_aff(img_data, model, zarr_path="/cajal/scratch/projects/misc/zuzur/test.zarr", do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
+    # ValueError('Codec does not support buffers of > 2147483647 bytes')
+
+    aff_pred2 = predict_aff(img_data, model, chunk_cube_size=250, zarr_path="/cajal/scratch/projects/misc/zuzur/test2.zarr", do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
+
