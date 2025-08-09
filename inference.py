@@ -8,34 +8,70 @@ from typing import Union, List, Tuple
 
 import numba
 import numpy as np
+import psutil
 import torch
 import torch.utils
 import zarr
 import dask
-from dask.distributed import (Client, LocalCluster)
+from dask import compute, persist, delayed
+from dask.distributed import Client, LocalCluster
+from dask_cuda import LocalCUDACluster
+from dask.diagnostics import ProgressBar
 import dask.array as da
+from dask_jobqueue import SLURMCluster
+from distributed import progress
 from filelock import FileLock
 from numba import jit
 from scipy.ndimage import distance_transform_cdt
 from torch import autocast
 from torch.nn.functional import sigmoid
 from tqdm import tqdm
-from tqdm.dask import TqdmCallback
+import tracemalloc
+import threading
 
 
 def scale_sigmoid(x: torch.Tensor) -> torch.Tensor:
     """Scale sigmoid to avoid numerical issues in high confidence fp16."""
     return sigmoid(0.2 * x)
 
-def timing(func):
+
+def measure_stats(func):
+    def monitor_memory(interval=0.1, result=None):
+        proc = psutil.Process(os.getpid())
+        peak = 0
+        while not getattr(monitor_memory, "stop", False):
+            rss = proc.memory_info().rss
+            peak = max(peak, rss)
+            time.sleep(interval)
+        if result is not None:
+            result["peak"] = peak  # Save peak memory to shared dict
+
     def wrapper(*args, **kwargs):
-        print(f"Starting '{func.__name__}'...")
+        memory_stats = {}
+        thread = threading.Thread(target=monitor_memory, kwargs={"interval": 0.1, "result": memory_stats})
+        thread.start()
+        torch.cuda.reset_peak_memory_stats()
+        tracemalloc.start()
         start = time.time()
+
         result = func(*args, **kwargs)
+
         end = time.time()
         elapsed = timedelta(seconds=end - start)
-        print(f"Finished '{func.__name__}' in {elapsed}")
-        return result
+        current, peak = tracemalloc.get_traced_memory()
+        max_mem = torch.cuda.max_memory_reserved()
+        monitor_memory.stop = True
+        thread.join()
+
+        stats = {
+            "time": f"{elapsed}",
+            "peak_python_mem": f"{peak / 1024**2:.2f} MB",
+            "max_cuda_mem": f"{max_mem / 1024 ** 2:.2f} MB",
+            "rss_mem": f"{memory_stats['peak'] / 1024 ** 2:.2f} MB"
+        }
+
+        return result, stats
+
     return wrapper
 
 
@@ -88,7 +124,6 @@ def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray
 
 @torch.no_grad()
 @autocast(device_type="cuda")
-@timing
 def patched_inference(
         img: Union[np.ndarray, zarr.Array],
         model: torch.nn.Module,
@@ -113,7 +148,8 @@ def patched_inference(
     Returns:
         The full prediction. Shape: (channel, x, y, z).
     """
-    print(f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
+    print(
+        f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
     img = img[:]  # load into memory (expensive!)
 
     patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
@@ -222,7 +258,6 @@ def get_single_pred_weight(do_overlap: bool, small_size: int) -> Union[np.ndarra
 
 @torch.no_grad()
 @autocast(device_type="cuda")
-@timing
 def predict_aff(
         img: Union[np.ndarray, zarr.Array],
         model: torch.nn.Module,
@@ -231,7 +266,8 @@ def predict_aff(
         do_overlap: bool = True,
         prediction_channels: int = 6,
         divide: int = 1,
-        chunk_cube_size: int = 1024
+        chunk_cube_size: int = 1024,
+        compute_backend: str = "local"
 ):
     """
     Perform patched affinity prediction with a model on an image.
@@ -239,6 +275,7 @@ def predict_aff(
     Args:
         img: The input image. Shape: (x, y, z, channel).
         model: The model to use for predictions.
+        zarr_path: Output path to save the prediction in zarr format.
         small_size: The size of the patches. Defaults to 128.
         do_overlap: Whether to perform overlapping predictions. Defaults to True:
             half of patch size for all 3 axes.
@@ -246,31 +283,61 @@ def predict_aff(
             dimensions are discarded). Defaults to 6 (3 short + 3 long range affinities).
         divide: The divisor for the image. Typically, 1 or 255 if img in [0, 255]
         chunk_cube_size: The maximal side length of a cube held in memory.
+        compute_backend: Type of computation / dask backend. One of:
+
+                - "local": uses a cycle on the local machine (default)
+                - "local_cluster": uses a localGPUcluster to utilize all local GPUs without SLURM
+                - "slurm": uses a slurm cluster with all available nodes
 
     Returns:
         The full prediction. Shape: (channel, x, y, z).
     """
-    print(f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
+    print(
+        f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
+    print(f"Parameters: cube size {chunk_cube_size}, compute backend {compute_backend}.")
 
     all_patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
     chunked_patch_coordinates = chunk_xyzs(all_patch_coordinates, chunk_cube_size)
 
     z = zarr.open_group(zarr_path, mode='w')
-    z.create_dataset('sum_pred', shape=(prediction_channels, *img.shape[:3]), chunks=(1, chunk_cube_size), dtype='f4')
-    z.create_dataset('sum_weight', shape=(1, *img.shape[:3]), chunks=(1, chunk_cube_size), dtype='f4')
+    zarr_chunk_size = min(chunk_cube_size, 512)
+    z.create_dataset('sum_pred', shape=(prediction_channels, *img.shape[:3]),
+                     chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='f4')
+    z.create_dataset('sum_weight', shape=(1, *img.shape[:3]),
+                     chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='f4')
 
-    # TODO: parallelize this!!!!!!!!!!!!!
-    cluster = LocalCluster(n_workers=4, threads_per_worker=1)
-    client = Client(cluster)
-    print("Dask Client Dashboard:", client.dashboard_link)
+    if compute_backend == "local":
+        for chunk in tqdm(chunked_patch_coordinates):
+            predict_aff_patches_chunked(chunk, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide)
+            torch.cuda.empty_cache() # TODO: does this help?
+    else:
+        if compute_backend == "local_cluster":
+            cluster = LocalCUDACluster(threads_per_worker=1)  # 1 worker per GPU
+        elif compute_backend == "slurm":
+            cluster = SLURMCluster(
+                cores=8,
+                memory="400GB",
+                processes=1,
+                worker_extra_args=["--resources processes=1", "--nthreads=1"],
+                job_extra_directives=["--gres=gpu:1"],
+                walltime="1-00:00:00"
+            )
+            cluster.adapt(minimum_jobs=1, maximum_jobs=32)
 
-    tasks = [dask.delayed(predict_aff_patches_chunked)(chunk, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide)
-                for chunk in chunked_patch_coordinates
-            ]
-    with TqdmCallback(desc="Overall Dask Progress (chunks)", unit="chunk", total=len(tasks)) as pbar:
-        dask.compute(*tasks)
-    #for chunk in tqdm(chunked_patch_coordinates):
-    #    predict_aff_patches_chunked(chunk, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide)
+        else:
+            raise NotImplementedError(f"Compute backend {compute_backend} not available.")
+
+        client = Client(cluster)
+        print(f"Waiting for workers...")
+        client.wait_for_workers(n_workers=1)
+        print("Dask Client Dashboard:", client.dashboard_link)
+        tasks = [dask.delayed(predict_aff_patches_chunked)(chunk, img, model, zarr_path, small_size, do_overlap,
+                                                           prediction_channels, divide)
+                 for chunk in chunked_patch_coordinates
+                 ]
+        futures = persist(tasks)
+        progress(futures)  # progress bar
+        compute(futures)
 
     tmp_sum_pred = da.from_zarr(f"{zarr_path}/sum_pred")
     tmp_sum_weight = da.from_zarr(f"{zarr_path}/sum_weight")
@@ -302,7 +369,8 @@ def chunk_xyzs(xyzs, chunk_cube_size=1024):
 
 @torch.no_grad()
 @autocast(device_type="cuda")
-def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_size, do_overlap, prediction_channels, divide):
+def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_size, do_overlap, prediction_channels,
+                                divide):
     """
     Patch-wise predicts affinities in-memory, using coordinates of all patches inside a chunk.
     Args:
@@ -318,13 +386,15 @@ def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_
     min_z = min(z for x, y, z in patch_coordinates)
 
     img_tmp = img[
-             min_x: max_x + small_size,
-             min_y: max_y + small_size,
-             min_z: max_z + small_size,
-             ]
+              min_x: max_x + small_size,
+              min_y: max_y + small_size,
+              min_z: max_z + small_size,
+              ]
     pred_tmp = np.zeros((prediction_channels, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
     weight_tmp = np.zeros((1, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
     single_pred_weight = get_single_pred_weight(do_overlap, small_size)
+
+    # TODO: load model here from path to save time / properly parallelize? (problematic to use during training where model is in memory only)
 
     for x_global, y_global, z_global in patch_coordinates:
         x = x_global - min_x
@@ -335,9 +405,10 @@ def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_
             -1, 0)[None]).to(model.device) / divide
         pred = scale_sigmoid(model(img_patch))[0, :prediction_channels]
 
-        weight_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += single_pred_weight if do_overlap else 1
-        pred_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += pred.detach().cpu().numpy() * (single_pred_weight[None] if do_overlap else 1)
-
+        weight_tmp[:, x: x + small_size, y: y + small_size,
+        z: z + small_size] += single_pred_weight if do_overlap else 1
+        pred_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += pred.detach().cpu().numpy() * (
+            single_pred_weight[None] if do_overlap else 1)
 
     z = zarr.open_group(zarr_path, mode='a')
     weight_mask = z['sum_weight']
@@ -345,37 +416,63 @@ def predict_aff_patches_chunked(patch_coordinates, img, model, zarr_path, small_
 
     with FileLock(f"{zarr_path}/sum_weight.lock"):
         weight_mask[
-            :,
-            min_x: max_x + small_size,
-            min_y: max_y + small_size,
-            min_z: max_z + small_size,
+        :,
+        min_x: max_x + small_size,
+        min_y: max_y + small_size,
+        min_z: max_z + small_size,
         ] += weight_tmp
 
     with FileLock(f"{zarr_path}/sum_pred.lock"):
         full_pred[
-            :,
-            min_x: max_x + small_size,
-            min_y: max_y + small_size,
-            min_z: max_z + small_size,
+        :,
+        min_x: max_x + small_size,
+        min_y: max_y + small_size,
+        min_z: max_z + small_size,
         ] += pred_tmp
 
 
-
-if __name__ == "__main__":
+def test_local_prediction():
     input_path = "/cajal/nvmescratch/projects/NISB/base/val/seed100/data.zarr"
     img_data = zarr.open(input_path, mode="r")["img"]
 
     model_path = "/cajal/scratch/projects/misc/zuzur/ss3/debug1GPU-seed0-batch_size1-small_size128/default/checkpoints/epoch=0-step=70000.ckpt"
     from BANIS import BANIS
+
     model = BANIS.load_from_checkpoint(model_path)
 
-    #aff_pred = patched_inference(img_data, model=model, do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
-    #store = zarr.DirectoryStore('/cajal/scratch/projects/misc/zuzur/test0.zarr')
-    #store.rmdir('')
-    #z = zarr.array(aff_pred, store=store, override=True)
+    all_stats = {}
 
-    #aff_pred2 = predict_aff(img_data, model, zarr_path="/cajal/scratch/projects/misc/zuzur/test.zarr", do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
-    # ValueError('Codec does not support buffers of > 2147483647 bytes')
+    for chunk_cube_size in [200, 400, 512, 750, 1024, 1500, 3000]:
+        measured_predict_aff = measure_stats(predict_aff)
 
-    aff_pred2 = predict_aff(img_data, model, chunk_cube_size=250, zarr_path="/cajal/scratch/projects/misc/zuzur/test2.zarr", do_overlap=True, prediction_channels=3, divide=255,small_size=model.hparams.small_size)
+        result, stats = measured_predict_aff(img_data, model, chunk_cube_size=chunk_cube_size, compute_backend="local",
+                        zarr_path=f"/cajal/scratch/projects/misc/zuzur/test{chunk_cube_size}.zarr", do_overlap=True,
+                        prediction_channels=3, divide=255, small_size=model.hparams.small_size)
 
+        all_stats[chunk_cube_size] = stats
+        print(f"chunk size {chunk_cube_size}: {stats}")
+
+    print(all_stats)
+    for (value, stat) in all_stats.items():
+        print(f"{value}: {stat}")
+
+
+def test_slurm_prediction():
+    input_path = "/cajal/nvmescratch/projects/NISB/base/val/seed100/data.zarr"
+    img_data = zarr.open(input_path, mode="r")["img"]
+
+    model_path = "/cajal/scratch/projects/misc/zuzur/ss3/debug1GPU-seed0-batch_size1-small_size128/default/checkpoints/epoch=0-step=70000.ckpt"
+    from BANIS import BANIS
+
+    model = BANIS.load_from_checkpoint(model_path)
+
+    measured_predict_aff = measure_stats(predict_aff)
+    # only one run - runtime dependent on number of available slurm nodes
+    result, stats = measured_predict_aff(img_data, model, chunk_cube_size=512, compute_backend="slurm",
+                    zarr_path=f"/cajal/scratch/projects/misc/zuzur/test_slurm.zarr", do_overlap=True,
+                    prediction_channels=3, divide=255, small_size=model.hparams.small_size)
+
+    print(stats)
+
+if __name__ == "__main__":
+    test_slurm_prediction()
