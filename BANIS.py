@@ -266,20 +266,12 @@ class BANIS(LightningModule):
         max_grad_before = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
         self.log("gradients/max_grad", max_grad_before)
 
-        for p in self.parameters():
-            if p.grad is not None:
-                p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e4, neginf=-1e4)
-        total_norm2 = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("gradients/clamped_total_norm", total_norm2.item())
-        max_grad2 = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("gradients/clamped_max_grad", max_grad2)
-
         self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
 
         total_norm_after = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("clipped_gradients/total_norm", total_norm_after.item(), on_step=True)
+        self.log("gradients/total_norm_clipped", total_norm_after.item(), on_step=True)
         max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("clipped_gradients/max_grad", max_grad_after)
+        self.log("gradients/max_grad_clipped", max_grad_after)
 
 
 
