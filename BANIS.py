@@ -274,17 +274,6 @@ class BANIS(LightningModule):
         self.log("gradients/max_grad_clipped", max_grad_after)
 
 
-
-def worker_init_fn(worker_id):
-    """ Ensures different seeds for each worker. """
-    # torch.initial_seed() is derived from the initial seed state but advanced for each worker
-    seed = torch.initial_seed() % (2**32)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    print(f"[Worker {worker_id}] Seed: {seed}")
-
-
 def main():
     args = parse_args()
     seed_everything(args.seed, workers=True)
