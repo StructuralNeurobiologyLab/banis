@@ -13,7 +13,6 @@ import torch
 import torchvision
 import zarr
 from nnunet_mednext import create_mednext_v1
-from nnunet_mednext import MedNeXtBlock, MedNeXtUpBlock, MedNeXtDownBlock
 from pytorch_lightning import LightningModule, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint, DeviceStatsMonitor, LearningRateMonitor
 from pytorch_lightning.loggers import TensorBoardLogger
@@ -235,19 +234,18 @@ class BANIS(LightningModule):
 
     def register_activation_hooks(self):
         for name, module in self.named_modules():
-            if isinstance(module, (MedNeXtUpBlock, MedNeXtDownBlock)):
-                def hook_fn(module, input, output, block_name=name):  # capture name in default arg
-                    if not self.training:  # don't log during validation
-                        return
-                    self.log_dict({
-                        f"activations/{block_name}_min": output.min(),
-                        f"activations/{block_name}_max": output.max(),
-                        f"activations/{block_name}_mean": output.mean(),
-                        f"activations/{block_name}_std": output.std(),
-                    })
-                    if torch.isnan(output).any():
-                        print(f"NaN in output of {block_name}")
-                module.register_forward_hook(hook_fn)
+            def hook_fn(module, input, output, block_name=name):  # capture name in default arg
+                if not self.training:  # don't log during validation
+                    return
+                self.log_dict({
+                    f"activations/{block_name}_min": output.min(),
+                    f"activations/{block_name}_max": output.max(),
+                    f"activations/{block_name}_mean": output.mean(),
+                    f"activations/{block_name}_std": output.std(),
+                })
+                if torch.isnan(output).any():
+                    print(f"NaN in output of {block_name}")
+            module.register_forward_hook(hook_fn)
 
     def setup(self, stage: str):
         if stage == 'fit':
