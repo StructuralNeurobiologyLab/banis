@@ -5,14 +5,14 @@ params:
     - 1e-2
   seed:
     - 0
-    #- 1
-    #- 2
-    #- 3
-    #- 4
+    - 1
+    - 2
+    - 3
+    - 4
   long_range:
     - 10
   batch_size:
-    - 1
+    - 8
   scheduler:
     - true
   model_id:
@@ -34,24 +34,21 @@ params:
   n_steps:
     - 1_000_000
   small_size:
-    - 256
+    - 128
   data_setting:
-    #- "base"
-    #- "liconn"
-    #- "multichannel"
-    #- "neg_guidance"
-    #- "no_touch_thick"
-    #- "pos_guidance"
-    #- "slice_perturbed"
-    #- "touching_thin"
+    - "base"
+    - "liconn"
+    - "multichannel"
+    - "neg_guidance"
+    - "no_touch_thick"
+    - "pos_guidance"
+    - "slice_perturbed"
+    - "touching_thin"
     - "train_100"
   base_data_path:
     - "/cajal/nvmescratch/projects/NISB/"
   save_path:
-    #- "/cajal/scratch/projects/misc/riegerfr/aff_nis/"
-    - "/cajal/scratch/projects/misc/zuzur/xl_banis"
-  exp_name:
-    - "xl_test"
+    - "/cajal/scratch/projects/misc/riegerfr/aff_nis/"
   real_data_path: #https://colab.research.google.com/github/funkelab/lsd/blob/master/lsd/tutorial/notebooks/lsd_data_download.ipynb
     - "/cajal/scratch/projects/misc/mdraw/data/funke/zebrafinch/training/"
   auto_resubmit:
