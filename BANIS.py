@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data import load_data
-from inference import scale_sigmoid, patched_inference, compute_connected_component_segmentation
+from inference import scale_sigmoid, compute_connected_component_segmentation, predict_aff
 from metrics import compute_metrics
 
 
@@ -164,11 +164,8 @@ class BANIS(LightningModule):
 
         img_data = zarr.open(os.path.join(seed_path, "data.zarr"), mode="r")["img"]
 
-        aff_pred = patched_inference(img_data, model=self, do_overlap=True, prediction_channels=3, divide=255,
-                                     small_size=self.hparams.small_size)
-
-        aff_pred = zarr.array(aff_pred, dtype=np.float16, store=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr",
-                              chunks=(3, 512, 512, 512), overwrite=True)
+        aff_pred = predict_aff(img_data, model=self, zarr_path=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr", do_overlap=True, prediction_channels=3, divide=255,
+                                     small_size=self.hparams.small_size, compute_backend="local")
 
         self._evaluate_thresholds(aff_pred, os.path.join(seed_path, "skeleton.pkl"), mode, global_step)
 
