@@ -1,4 +1,5 @@
-import gc
+import shutil
+from collections import defaultdict
 from typing import Union, List, Tuple
 
 import numba
@@ -6,6 +7,13 @@ import numpy as np
 import torch
 import torch.utils
 import zarr
+import dask
+from dask import compute, persist, delayed
+from dask.distributed import Client, LocalCluster
+from dask.diagnostics import ProgressBar
+import dask.array as da
+from distributed import progress
+from filelock import FileLock
 from numba import jit
 from scipy.ndimage import distance_transform_cdt
 from torch import autocast
@@ -16,6 +24,53 @@ from tqdm import tqdm
 def scale_sigmoid(x: torch.Tensor) -> torch.Tensor:
     """Scale sigmoid to avoid numerical issues in high confidence fp16."""
     return sigmoid(0.2 * x)
+
+
+def measure_stats(func):
+    import os
+    import time
+    from datetime import timedelta
+    import tracemalloc
+    import threading
+    import psutil
+
+    def monitor_memory(interval=0.1, result=None):
+        proc = psutil.Process(os.getpid())
+        peak = 0
+        while not getattr(monitor_memory, "stop", False):
+            rss = proc.memory_info().rss
+            peak = max(peak, rss)
+            time.sleep(interval)
+        if result is not None:
+            result["peak"] = peak  # Save peak memory to shared dict
+
+    def wrapper(*args, **kwargs):
+        memory_stats = {}
+        thread = threading.Thread(target=monitor_memory, kwargs={"interval": 0.1, "result": memory_stats})
+        thread.start()
+        torch.cuda.reset_peak_memory_stats()
+        tracemalloc.start()
+        start = time.time()
+
+        result = func(*args, **kwargs)
+
+        end = time.time()
+        elapsed = timedelta(seconds=end - start)
+        current, peak = tracemalloc.get_traced_memory()
+        max_mem = torch.cuda.max_memory_reserved()
+        monitor_memory.stop = True
+        thread.join()
+
+        stats = {
+            "time": f"{elapsed}",
+            "peak_python_mem": f"{peak / 1024**2:.2f} MB",
+            "max_cuda_mem": f"{max_mem / 1024 ** 2:.2f} MB",
+            "rss_mem": f"{memory_stats['peak'] / 1024 ** 2:.2f} MB"
+        }
+
+        return result, stats
+
+    return wrapper
 
 
 @jit(nopython=True)
@@ -29,7 +84,7 @@ def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray
     Returns:
         The segmentation. Shape: (x, y, z).
     """
-    visited = np.zeros(tuple(hard_aff.shape[1:]), dtype=np.uint8)
+    visited = np.zeros(tuple(hard_aff.shape[1:]), dtype=numba.boolean)
     seg = np.zeros(tuple(hard_aff.shape[1:]), dtype=np.uint32)
     cur_id = 1
     for i in range(visited.shape[0]):
@@ -67,59 +122,101 @@ def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray
 
 @torch.no_grad()
 @autocast(device_type="cuda")
-def patched_inference(
+def predict_aff(
         img: Union[np.ndarray, zarr.Array],
-        model: torch.nn.Module,
+        model: torch.nn.Module = None,
+        model_path: str = None,
+        zarr_path: str = "aff_prediction.zarr",
         small_size: int = 128,
         do_overlap: bool = True,
         prediction_channels: int = 6,
         divide: int = 1,
-) -> np.ndarray:
+        chunk_cube_size: int = 1024,
+        compute_backend: str = "local"
+):
     """
-    Perform patched inference with a model on an image.
+    Perform patched affinity prediction with a model on an image.
 
     Args:
         img: The input image. Shape: (x, y, z, channel).
-        model: The model to use for predictions.
+        model: The model to use for predictions (only for local prediction).
+        model_path: Path to the model checkpoint to use for predictions (if model not specified).
+        zarr_path: Output path to save the prediction in zarr format.
         small_size: The size of the patches. Defaults to 128.
         do_overlap: Whether to perform overlapping predictions. Defaults to True:
             half of patch size for all 3 axes.
         prediction_channels: The number of channels in the output (additional model output
             dimensions are discarded). Defaults to 6 (3 short + 3 long range affinities).
         divide: The divisor for the image. Typically, 1 or 255 if img in [0, 255]
+        chunk_cube_size: The maximal side length of a cube held in memory.
+        compute_backend: Type of computation / dask backend. One of:
+
+                - "local": uses a cycle on the local machine (default)
+                - "local_cluster": uses a localGPUcluster to utilize all local GPUs without SLURM
+                - "slurm": uses a slurm cluster with all available nodes
 
     Returns:
         The full prediction. Shape: (channel, x, y, z).
     """
     print(
         f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
-    img = img[:]  # load into memory (expensive!)
+    print(f"Parameters: cube size {chunk_cube_size}, compute backend {compute_backend}.")
 
-    patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
-    single_pred_weight = get_single_pred_weight(do_overlap, small_size)
-    # to weight overlapping predictions lower close to the boundaries
+    all_patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
+    chunked_patch_coordinates = chunk_xyzs(all_patch_coordinates, chunk_cube_size)
 
-    weight_sum = np.zeros((1, *img.shape[:3]), dtype=np.float32)
-    weighted_pred = np.zeros((prediction_channels, *img.shape[:3]), dtype=np.float32)
+    z = zarr.open_group(zarr_path + "_tmp", mode='w')
+    zarr_chunk_size = min(chunk_cube_size, 512)
+    z.create_dataset('sum_pred', shape=(prediction_channels, *img.shape[:3]),
+                     chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='f4')
+    z.create_dataset('sum_weight', shape=(1, *img.shape[:3]),
+                     chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='f4')
 
-    device = next(model.parameters()).device
-    assert device.type != 'cpu'
+    if compute_backend == "local":
+        if not model:
+            from BANIS import BANIS
+            model = BANIS.load_from_checkpoint(model_path)
+        for chunk in tqdm(chunked_patch_coordinates):
+            predict_aff_patches_chunked(chunk, img, model, zarr_path + "_tmp", small_size, do_overlap, prediction_channels, divide)
+            torch.cuda.empty_cache() # TODO: does this help?
+    else:
+        if compute_backend == "local_cluster":
+            from dask_cuda import LocalCUDACluster
+            cluster = LocalCUDACluster(threads_per_worker=1)  # 1 worker per GPU
+        elif compute_backend == "slurm":
+            from dask_jobqueue import SLURMCluster
+            cluster = SLURMCluster(
+                cores=8,
+                memory="400GB",
+                processes=1,
+                worker_extra_args=["--resources processes=1", "--nthreads=1"],
+                job_extra_directives=["--gres=gpu:1"],
+                walltime="1-00:00:00"
+            )
+            cluster.adapt(minimum_jobs=1, maximum_jobs=32)
 
-    for x, y, z in tqdm(patch_coordinates):
-        img_patch = torch.tensor(
-            np.moveaxis(img[x: x + small_size, y: y + small_size, z: z + small_size], -1, 0)[None]).half().to(
-            device) / divide
-        pred = scale_sigmoid(model(img_patch))[0, :prediction_channels]
+        else:
+            raise NotImplementedError(f"Compute backend {compute_backend} not available.")
 
-        weight_sum[:, x: x + small_size, y: y + small_size,
-        z: z + small_size] += single_pred_weight if do_overlap else 1
-        weighted_pred[:, x: x + small_size, y: y + small_size, z: z + small_size] += pred.cpu().numpy() * (
-            single_pred_weight[None] if do_overlap else 1)
-    del img  # to save memory before division
-    # assert np.all(weight_sum > 0)
-    np.divide(weighted_pred, weight_sum, out=weighted_pred)
+        client = Client(cluster)
+        print(f"Waiting for workers...")
+        client.wait_for_workers(n_workers=1)
+        print("Dask Client Dashboard:", client.dashboard_link)
+        tasks = [dask.delayed(predict_aff_patches_chunked)(chunk, img, model_path, zarr_path + "_tmp", small_size, do_overlap, prediction_channels, divide)
+                 for chunk in chunked_patch_coordinates
+                 ]
+        futures = persist(tasks)
+        progress(futures)  # progress bar
+        compute(futures)
 
-    return weighted_pred
+    tmp_sum_pred = da.from_zarr(f"{zarr_path}_tmp/sum_pred")
+    tmp_sum_weight = da.from_zarr(f"{zarr_path}_tmp/sum_weight")
+    aff = tmp_sum_pred / tmp_sum_weight
+    aff.to_zarr(zarr_path, overwrite=True)
+
+    shutil.rmtree(zarr_path + "_tmp")
+
+    return zarr.open(zarr_path, mode="r")
 
 
 def get_coordinates(
@@ -197,3 +294,122 @@ def get_single_pred_weight(do_overlap: bool, small_size: int) -> Union[np.ndarra
         return distance_transform_cdt(pred_weight_helper).astype(np.float32)[1:-1, 1:-1, 1:-1]
     else:
         return None
+
+
+def chunk_xyzs(xyzs, chunk_cube_size=1024):
+    """
+    Chunks the patch coordinates into chunks containing coordinates from the same part of the big cube.
+    Args:
+        xyzs: list of all coordinates
+        chunk_cube_size: side length of each chunk
+    Returns:
+        chunked coordinates
+    """
+    chunks = defaultdict(list)
+    for x, y, z in xyzs:
+        chunks[(x // chunk_cube_size, y // chunk_cube_size, z // chunk_cube_size)].append((x, y, z))
+    return list(chunks.values())
+
+
+@torch.no_grad()
+@autocast(device_type="cuda")
+def predict_aff_patches_chunked(patch_coordinates, img, model_path, zarr_path, small_size, do_overlap, prediction_channels, divide):
+    """
+    Patch-wise predicts affinities in-memory, using coordinates of all patches inside a chunk.
+    Args:
+        patch_coordinates: List of patch coordinates. The extension of the coordinates must fit in memory (use adequate chunk size).
+    Returns:
+        Affinity prediction of the input chunk.
+    """
+    max_x = max(x for x, y, z in patch_coordinates)
+    max_y = max(y for x, y, z in patch_coordinates)
+    max_z = max(z for x, y, z in patch_coordinates)
+    min_x = min(x for x, y, z in patch_coordinates)
+    min_y = min(y for x, y, z in patch_coordinates)
+    min_z = min(z for x, y, z in patch_coordinates)
+
+    img_tmp = img[
+              min_x: max_x + small_size,
+              min_y: max_y + small_size,
+              min_z: max_z + small_size,
+              ]
+    pred_tmp = np.zeros((prediction_channels, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
+    weight_tmp = np.zeros((1, img_tmp.shape[0], img_tmp.shape[1], img_tmp.shape[2]), dtype=np.float32)
+    single_pred_weight = get_single_pred_weight(do_overlap, small_size)
+
+    from BANIS import BANIS
+    print(model_path, flush=True)
+    model = BANIS.load_from_checkpoint(model_path)
+
+    for x_global, y_global, z_global in patch_coordinates:
+        x = x_global - min_x
+        y = y_global - min_y
+        z = z_global - min_z
+        img_patch = torch.tensor(np.moveaxis(
+            img_tmp[x: x + small_size, y: y + small_size, z: z + small_size],
+            -1, 0)[None]).to(model.device) / divide
+        pred = scale_sigmoid(model(img_patch))[0, :prediction_channels]
+
+        weight_tmp[:, x: x + small_size, y: y + small_size,
+        z: z + small_size] += single_pred_weight if do_overlap else 1
+        pred_tmp[:, x: x + small_size, y: y + small_size, z: z + small_size] += pred.detach().cpu().numpy() * (
+            single_pred_weight[None] if do_overlap else 1)
+
+    z = zarr.open_group(zarr_path, mode='a')
+    weight_mask = z['sum_weight']
+    full_pred = z['sum_pred']
+
+    with FileLock(f"{zarr_path}/sum_weight.lock"):
+        weight_mask[
+        :,
+        min_x: max_x + small_size,
+        min_y: max_y + small_size,
+        min_z: max_z + small_size,
+        ] += weight_tmp
+
+    with FileLock(f"{zarr_path}/sum_pred.lock"):
+        full_pred[
+        :,
+        min_x: max_x + small_size,
+        min_y: max_y + small_size,
+        min_z: max_z + small_size,
+        ] += pred_tmp
+
+
+def full_inference(
+        # AFFINITY PREDICTION ARGUMENTS:
+        img: Union[np.ndarray, zarr.Array],
+        model_path: str,
+        aff_zarr_path: str = "aff_prediction.zarr",
+        small_size: int = 128,
+        do_overlap: bool = True,
+        prediction_channels: int = 6,
+        divide: int = 1,
+        chunk_cube_size: int = 1024,
+        compute_backend: str = "local",
+        # POSTPROCESSING ARGUMENTS:
+        postprocessing_type: str = "thresholding",
+        thr: float = 0.5,
+        seg_zarr_path: str = "seg_prediction.zarr"
+):
+
+    aff = predict_aff(
+        img,
+        model_path=model_path,
+        zarr_path=aff_zarr_path,
+        small_size=small_size,
+        do_overlap=do_overlap,
+        prediction_channels=prediction_channels,
+        divide=divide,
+        chunk_cube_size=chunk_cube_size,
+        compute_backend=compute_backend
+    )
+
+    if postprocessing_type == "thresholding":
+        seg = compute_connected_component_segmentation(aff[:3] > thr)
+        zarr.array(seg, store=seg_zarr_path)
+    elif postprocessing_type == "mws":
+        raise NotImplementedError(f"Mutex Watershed is not implemented")
+    else:
+        raise NotImplementedError(f"Postprocessing type {postprocessing_type} is not implemented")
+
