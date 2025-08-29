@@ -514,7 +514,7 @@ class Thresholding(Postprocessing):
         self.thr = thr
 
     @jit(nopython=True)
-    def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray:
+    def compute_connected_component_segmentation(self, hard_aff: np.ndarray) -> np.ndarray:
         """
         Compute connected components from affinities.
 
