@@ -1,6 +1,7 @@
 import zarr
 
 from inference import measure_stats, predict_aff, full_inference, thresholding
+from inference2 import Thresholding
 
 
 def test_local_prediction():
@@ -57,7 +58,9 @@ def test_full_inference():
 
 def test_thresholding():
     aff = zarr.open("/cajal/scratch/projects/misc/zuzur/skeleton_recall/rerun_base/dsbase_s0_a0_25-03-20_19-44-08-067760/pred_aff_val_6.zarr/")
-    thresholding(aff, 0.7685, "test1.zarr", 300, "local")
+    postprocessor = Thresholding(1024, "local", 0.7685)
+    postprocessor.aff_to_seg(aff, zarr_path="test2.zarr")
+    #thresholding(aff, 0.7685, "test2.zarr", 1024, "local")
 
 if __name__ == "__main__":
     test_thresholding()
