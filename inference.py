@@ -1,7 +1,9 @@
 import shutil
 from collections import defaultdict
+from copy import deepcopy
 from typing import Union, List, Tuple
 
+import cc3d
 import numba
 import numpy as np
 import torch
@@ -15,10 +17,12 @@ import dask.array as da
 from distributed import progress
 from filelock import FileLock
 from numba import jit
+from numpy.f2py.crackfortran import updatevars
 from scipy.ndimage import distance_transform_cdt
 from torch import autocast
 from torch.nn.functional import sigmoid
 from tqdm import tqdm
+import mwatershed
 
 
 def scale_sigmoid(x: torch.Tensor) -> torch.Tensor:
@@ -162,7 +166,7 @@ def predict_aff(
         f"Performing patched inference with do_overlap={do_overlap} for img of shape {img.shape} and dtype {img.dtype}")
     print(f"Parameters: cube size {chunk_cube_size}, compute backend {compute_backend}.")
 
-    all_patch_coordinates = get_coordinates(img.shape[:3], small_size, do_overlap)
+    all_patch_coordinates = get_coordinates(img.shape[:3], small_size, overlap = small_size // 2 if do_overlap else 0, last_has_smaller_overlap=True)
     chunked_patch_coordinates = chunk_xyzs(all_patch_coordinates, chunk_cube_size)
 
     z = zarr.open_group(zarr_path + "_tmp", mode='w')
@@ -219,60 +223,32 @@ def predict_aff(
     return zarr.open(zarr_path, mode="r")
 
 
-def get_coordinates(
-        shape: Tuple[int, int, int], small_size: int, do_overlap: bool
-) -> List[Tuple[int, int, int]]:
+def get_coordinates(shape: Tuple[int, int, int], small_size: int, overlap: int = 0, last_has_smaller_overlap: bool = True) -> List[Tuple[int, int, int]]:
     """
-    Get coordinates for cubes to be predicted.
-
+    Get coordinates for smaller patches to process a big cube in memory.
     Args:
-        shape: The shape of the input image (x, y, z).
+        shape: The shape of the input (x, y, z).
         small_size: The size of the patches.
-        do_overlap: Whether to perform overlapping predictions.
-
+        overlap: The overlap between patches. The default 0 means no overlap (next patch starts on the next pixel from the previous patch). For half-cube overlap set overlap=small_size//2, for 1-pixel overlap set overlap=1.
+        last_has_smaller_overlap: If the last patch with the specified size and overlap would exceed the big cube, move the patch so that it ends with the big cube, creating a bigger overlap in this patch.
     Returns:
-        List of (x, y, z) coordinates for prediction cubes.
+        List of (x, y, z) coordinates (starting voxel of a patch) for processing of smaller patches.
     """
-    offsets = [get_offsets(s, small_size) for s in shape]
+    if overlap < 0 or overlap >= small_size:
+        raise ValueError(f"Overlap must be between 0 and {small_size}.")
+    offsets = [get_offsets(s, small_size, small_size-overlap, last_has_smaller_overlap) for s in shape]
     xyzs = [(x, y, z) for x in offsets[0] for y in offsets[1] for z in offsets[2]]
-    if do_overlap:  # Add shifted cubes (half cube overlap)
-        offset = small_size // 2
-
-        xyzs_shifted = [
-            set((x + offset, y, z) for x, y, z in xyzs),
-            set((x, y + offset, z) for x, y, z in xyzs),
-            set((x, y, z + offset) for x, y, z in xyzs),
-            set((x + offset, y + offset, z) for x, y, z in xyzs),
-            set((x + offset, y, z + offset) for x, y, z in xyzs),
-            set((x, y + offset, z + offset) for x, y, z in xyzs),
-            set((x + offset, y + offset, z + offset) for x, y, z in xyzs),
-        ]
-        xyzs_shifted = set(
-            (x, y, z)
-            for s in xyzs_shifted
-            for x, y, z in s
-            if x + small_size <= shape[0]
-            and y + small_size <= shape[1]
-            and z + small_size <= shape[2]
-        )
-        xyzs = list(set.union(set(xyzs), xyzs_shifted))
     return xyzs
 
 
-def get_offsets(big_size: int, small_size: int) -> List[int]:
-    """
-    Calculate offsets for image patching.
-
-    Args:
-        big_size: The size of the whole image.
-        small_size: The size of the patches.
-
-    Returns:
-        List of offsets.
-    """
-    offsets = list(range(0, big_size - small_size + 1, small_size))
-    if offsets[-1] != big_size - small_size:
+def get_offsets(big_size, small_size, step, last_has_smaller_overlap):
+    offsets = list(range(0, big_size - small_size + 1, step))
+    if small_size > big_size:
+        offsets.append(0)
+    elif offsets[-1] != big_size - small_size and last_has_smaller_overlap:
         offsets.append(big_size - small_size)
+    elif offsets[-1] != big_size - small_size and not last_has_smaller_overlap:
+        offsets.append(len(offsets) * step)
     return offsets
 
 
@@ -376,21 +352,205 @@ def predict_aff_patches_chunked(patch_coordinates, img, model_path, zarr_path, s
         ] += pred_tmp
 
 
+def update_fragment_agglomeration(fragment_agglomeration, matching_l, matching_h, chunk_l, chunk_h):
+    combined = np.stack([matching_l, matching_h]).T
+    uniques = np.unique(combined, axis=0)
+    for id_l, id_h in uniques:
+        if id_l > 0 and id_h > 0:
+            fragment_agglomeration.setdefault((chunk_h, id_h), set()).add((chunk_l, id_l))
+            fragment_agglomeration.setdefault((chunk_l, id_l), set()).add((chunk_h, id_h))
+    return fragment_agglomeration
+
+
+def flatten_agglomeration(fragment_agglomeration):
+    """
+    Computes connected components in the fragment agglomeration graph, and assigns the fragments new ids starting from 1.
+    Args:
+        fragment_agglomeration: dictionary with keys (chunk_id, fragment_id), and values a set of (chunk_id, fragment_id) in another chunk (cube) that should be connected
+    Returns:
+        fragment_agglomeration_flattened: dictionary with keys (chunk_id, fragment_id) and values the global component index
+    """
+    cur_id = 1
+    fragment_agglomeration_flattened = dict()
+    for position_id in tqdm(fragment_agglomeration):  # (chunk, idx) = position_id
+        if position_id not in fragment_agglomeration_flattened:
+            to_visit = {position_id}
+            visited = set()
+            while len(to_visit) > 0:
+                current = to_visit.pop()
+                if current not in visited:
+                    visited.add(current)
+                    for neighbor in fragment_agglomeration[current]:
+                        to_visit.add(neighbor)
+            for v in visited:
+                assert v not in fragment_agglomeration_flattened
+                fragment_agglomeration_flattened[v] = cur_id
+            cur_id += 1
+
+    return cur_id, fragment_agglomeration_flattened
+
+
+def add_all_fragments_to_agglomeration(fragment_agglomeration_flattened, cur_id, chunks, zarr_path):
+    z = zarr.open(f"{zarr_path}_tmp/instances_patched")
+    for i, chunk in enumerate(tqdm(chunks)):
+        data = z[i, :, :, :]
+        for idx in range(1, int(data.max()) + 1):  #  assuming each chunk has contiguous indices from 0 to max
+            if (i, idx) not in fragment_agglomeration_flattened:
+                fragment_agglomeration_flattened[(i, idx)] = cur_id
+                cur_id += 1
+    return fragment_agglomeration_flattened
+
+
+def thresholding(aff, thr, zarr_path, chunk_cube_size, compute_backend):
+    chunks = get_coordinates(aff.shape[1:], chunk_cube_size, overlap=0, last_has_smaller_overlap=False)
+    reverse_chunks = {chunk: i for i, chunk in enumerate(chunks)}
+
+    z_root = zarr.open_group(zarr_path + "_tmp", mode='w')
+    zarr_chunk_size = min(chunk_cube_size, 512)
+    z_root.create_dataset('instances_patched', shape=(len(chunks), chunk_cube_size, chunk_cube_size, chunk_cube_size),
+                     chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='i4')
+
+    # SEGMENT AFFINITIES IN CHUNKS THAT FIT IN MEMORY
+    if compute_backend == "local":
+        for i, chunk in enumerate(tqdm(chunks)):
+            x, y, z = chunk
+            x_end, y_end, z_end = min(x + chunk_cube_size, aff.shape[1]), min(y + chunk_cube_size, aff.shape[2]), min(z + chunk_cube_size, aff.shape[3])
+            curr_aff = aff[:3, x : x_end, y : y_end, z : z_end]
+            curr_seg = compute_connected_component_segmentation(curr_aff > thr)
+            z_root["instances_patched"][i, : x_end - x, : y_end - y, : z_end - z] = curr_seg
+    else:
+        raise NotImplementedError(f"Compute backend {compute_backend} not implemented.")
+
+    # FIND GROUPS OF FRAGMENTS THAT SHOULD BE MERGED BETWEEN CHUNKS
+    if compute_backend == "local":
+        fragment_agglomeration = {}
+        for i, chunk in enumerate(tqdm(chunks)):
+            x, y, z = chunk
+            x_end, y_end, z_end = min(x + chunk_cube_size, aff.shape[1]), min(y + chunk_cube_size, aff.shape[2]), min(z + chunk_cube_size, aff.shape[3])
+
+            # merge according to short range affinities between each pair of IDs in neighboring cubes
+            if x_end < aff.shape[1]:
+                chunk_h = reverse_chunks[x + chunk_cube_size, y, z]
+                border_aff = aff[0, x_end - 1 : x_end, y : y_end, z : z_end] >= thr
+                matching_ids_l = z_root["instances_patched"][i, -1:, :, :][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                matching_ids_h = z_root["instances_patched"][chunk_h, -1:, :, :][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                fragment_agglomeration = update_fragment_agglomeration(fragment_agglomeration, matching_ids_l, matching_ids_h, i, chunk_h)
+
+            if y_end < aff.shape[2]:
+                chunk_h = reverse_chunks[x, y + chunk_cube_size, z]
+                border_aff = aff[0, x : x_end, y_end - 1 : y_end, z : z_end] >= thr
+                matching_ids_l = z_root["instances_patched"][i, :, -1:, :][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                matching_ids_h = z_root["instances_patched"][chunk_h, :, -1:, :][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                fragment_agglomeration = update_fragment_agglomeration(fragment_agglomeration, matching_ids_l, matching_ids_h, i, chunk_h)
+
+            if z_end < aff.shape[3]:
+                chunk_h = reverse_chunks[x, y, z + chunk_cube_size]
+                border_aff = aff[0, x : x_end, y : y_end, z_end - 1 : z_end] >= thr
+                matching_ids_l = z_root["instances_patched"][i, :, :, -1:][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                matching_ids_h = z_root["instances_patched"][chunk_h, :, :, -1:][:border_aff.shape[0], :border_aff.shape[1], :border_aff.shape[2]][border_aff]
+                fragment_agglomeration = update_fragment_agglomeration(fragment_agglomeration, matching_ids_l, matching_ids_h, i, chunk_h)
+
+        curr_id, fragment_agglomeration_flattened = flatten_agglomeration(fragment_agglomeration)
+        print("MERGING CHUNKS FLATTENED AGGLOMERATION LENGTH", len(fragment_agglomeration_flattened))
+        fragment_agglomeration_flattened = add_all_fragments_to_agglomeration(fragment_agglomeration_flattened, curr_id, chunks, zarr_path)
+        print("ALL CHUNKS FLATTENED AGGLOMERATION LENGTH", len(fragment_agglomeration_flattened))
+
+    else:
+        raise NotImplementedError(f"Compute backend {compute_backend} not implemented.")
+
+    # MERGE AND RELABEL INSTANCES GLOBALLY
+    z_final = zarr.create(shape=aff.shape[1:],
+                          chunks=(zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='i4',
+                          store=zarr_path, overwrite=True)
+
+    if compute_backend == "local":
+        for i, chunk in enumerate(tqdm(chunks)):
+            x, y, z = chunk
+            x_end, y_end, z_end = min(x + chunk_cube_size, aff.shape[1]), min(y + chunk_cube_size, aff.shape[2]), min(z + chunk_cube_size, aff.shape[3])
+            data = z_root["instances_patched"][i, :x_end, :y_end, :z_end]
+            perm = [0]
+            for idx in range(1, int(data.max()) + 1):  # assuming each chunk has contiguous indices from 0 to max
+                assert (i, idx) in fragment_agglomeration_flattened  # all fragments have a new index (congiguous from 0)
+                perm.append(fragment_agglomeration_flattened[(i, idx)])
+            perm = np.array(perm, dtype=np.uint64)
+            relabeled = perm[data]
+            z_final[x : x_end, y : y_end, z : z_end] = relabeled
+
+    else:
+        raise NotImplementedError(f"Compute backend {compute_backend} not implemented.")
+
+    shutil.rmtree(zarr_path + "_tmp")
+
+
+def compute_mws_segmentation(cur_aff, mws_bias_short, mws_bias_long, long_range=10):
+    """
+    Mutex Watershed segmentation.
+    Args:
+        cur_aff: An affinity array with 3 short-range and 3 long-range affinities (size must fit in memory).
+        mws_bias_short: Short-range bias
+        mws_bias_long: Long-range bias
+    Returns:
+        Segmentation of the affinities.
+    """
+    cur_aff = deepcopy(cur_aff).astype(np.float64)
+    cur_aff[:3] += mws_bias_short
+    cur_aff[3:] += mws_bias_long
+
+    cur_aff[:3] = np.clip(cur_aff[:3], 0, 1)  # short-range attractive edges
+    cur_aff[3:] = np.clip(cur_aff[3:], -1, 0)  # long-range repulsive edges (see the Mutex Watershed paper)
+
+    mws_pred = mwatershed.agglom(
+        affinities=cur_aff,
+        offsets=(
+            [
+                [1, 0, 0],
+                [0, 1, 0],
+                [0, 0, 1],
+                [long_range, 0, 0],
+                [0, long_range, 0],
+                [0, 0, long_range],
+            ]
+        ),
+    )
+
+    # mwatershed is wasteful with IDs (not contiguous) -> filter out single voxel objects and relabel again
+    # size filter. single voxel objects are irrelevant for merging, take ~95% of IDs in an example cube, causing OOM when creating fragment_agglomeration
+    dusted = cc3d.dust(  # does a cc first (reducing false mergers in add_to_agglomeration)
+        mws_pred,
+        threshold=2,
+        connectivity=6,
+        in_place=False,
+    )
+    # relabeling to save IDs
+    pred_relabeled, N = cc3d.connected_components(
+        dusted, return_N=True, connectivity=6
+    )
+
+    assert (pred_relabeled[mws_pred == 0] == 0).all()  # 0 stays 0
+    assert N <= np.iinfo(np.uint32).max
+
+    pred = pred_relabeled.astype(np.uint32)
+    return pred
+
+
 def full_inference(
+        # RESOURCES ARGUMENTS:
+        chunk_cube_size: int = 1024,
+        compute_backend: str = "local",
         # AFFINITY PREDICTION ARGUMENTS:
-        img: Union[np.ndarray, zarr.Array],
-        model_path: str,
+        img: Union[np.ndarray, zarr.Array] = None,
+        model_path: str = None,
         aff_zarr_path: str = "aff_prediction.zarr",
         small_size: int = 128,
         do_overlap: bool = True,
         prediction_channels: int = 6,
         divide: int = 1,
-        chunk_cube_size: int = 1024,
-        compute_backend: str = "local",
         # POSTPROCESSING ARGUMENTS:
         postprocessing_type: str = "thresholding",
+        seg_zarr_path: str = "seg_prediction.zarr",
         thr: float = 0.5,
-        seg_zarr_path: str = "seg_prediction.zarr"
+        mws_bias_short: float = -0.5,
+        mws_bias_long: float = -0.5,
 ):
 
     aff = predict_aff(
@@ -409,7 +569,8 @@ def full_inference(
         seg = compute_connected_component_segmentation(aff[:3] > thr)
         zarr.array(seg, store=seg_zarr_path)
     elif postprocessing_type == "mws":
-        raise NotImplementedError(f"Mutex Watershed is not implemented")
+        seg = mws(aff, seg_zarr_path, mws_bias_short, mws_bias_long)
     else:
         raise NotImplementedError(f"Postprocessing type {postprocessing_type} is not implemented")
 
+    print(f"Segmentation saved at {seg_zarr_path}.")
