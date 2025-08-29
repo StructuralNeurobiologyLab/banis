@@ -513,8 +513,9 @@ class Thresholding(Postprocessing):
         super().__init__(chunk_cube_size, compute_backend)
         self.thr = thr
 
+    @staticmethod
     @jit(nopython=True)
-    def compute_connected_component_segmentation(self, hard_aff: np.ndarray) -> np.ndarray:
+    def compute_connected_component_segmentation(hard_aff: np.ndarray) -> np.ndarray:
         """
         Compute connected components from affinities.
 
