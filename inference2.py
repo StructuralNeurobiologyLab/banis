@@ -441,7 +441,7 @@ class Postprocessing:
         x_end, y_end, z_end = self.get_xyz_end(chunk, aff.shape)
         curr_aff = aff[:, x : x_end, y : y_end, z : z_end]
         curr_seg = self.segment_chunk(curr_aff)
-        with zarr.open(zarr_path, mode="w", chunks=curr_seg.shape) as z_root:
+        with zarr.open(zarr_path, mode="w") as z_root:
             z_root[i, : x_end - x, : y_end - y, : z_end - z] = curr_seg
 
     def segment_chunk(self, curr_aff):
