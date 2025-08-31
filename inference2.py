@@ -76,6 +76,17 @@ class Utils:
         """Scale sigmoid to avoid numerical issues in high confidence fp16."""
         return sigmoid(0.2 * x)
 
+    @staticmethod
+    def get_xyz_end(chunk, chunk_cube_size, aff_shape):
+        """
+        Returns the end indices of a chunk, that correspond either to the chunk size, or align with the size of the affinities.
+        """
+        x, y, z = chunk
+        x_end, y_end, z_end = (min(x + chunk_cube_size, aff_shape[1]),
+                               min(y + chunk_cube_size, aff_shape[2]),
+                               min(z + chunk_cube_size, aff_shape[3]))
+        return (x_end, y_end, z_end)
+
 
 class AffinityPredictor:
     def __init__(self,
@@ -246,27 +257,28 @@ class Postprocessing:
     def aff_to_seg(self, aff, zarr_path):
         chunks = Utils.get_coordinates(aff.shape[1:], self.chunk_cube_size, overlap=1, last_has_smaller_overlap=False)
         reverse_chunks = {chunk: i for i, chunk in enumerate(chunks)}
+        patched_zarr_path = "tmp_" + zarr_path
 
         zarr_chunk_size = min(self.chunk_cube_size, 512)
         z_root = zarr.create(shape=(len(chunks), self.chunk_cube_size, self.chunk_cube_size, self.chunk_cube_size),
-                             store="tmp_" + zarr_path, dtype='i4', overwrite=True,
+                             store=patched_zarr_path, dtype='i4', overwrite=True,
                              chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size))
 
         # SEGMENT AFFINITIES IN CHUNKS THAT FIT IN MEMORY
-        self.patched_segment_affinities(aff, "tmp_" + zarr_path, chunks)
+        self.patched_segment_affinities(aff, patched_zarr_path, chunks)
 
         # FIND GROUPS OF FRAGMENTS THAT SHOULD BE MERGED BETWEEN CHUNKS
-        fragment_agglomeration = self.agglomerate_fragments(chunks, reverse_chunks, zarr_path, aff.shape)
+        fragment_agglomeration = self.agglomerate_fragments(chunks, reverse_chunks, patched_zarr_path, aff.shape)
 
         # MERGE AND RELABEL INSTANCES GLOBALLY
-        self.merge_and_relabel(fragment_agglomeration, "tmp_" + zarr_path, zarr_path, chunks, aff.shape)
+        self.merge_and_relabel(fragment_agglomeration, patched_zarr_path, zarr_path, chunks, aff.shape)
 
         return
 
-    def patched_segment_affinities(self, aff, zarr_path, chunks):
+    def patched_segment_affinities(self, aff, patched_zarr_path, chunks):
         if self.compute_backend == "local":
             for i, chunk in enumerate(tqdm(chunks)):
-                self.segment_chunk_wrapped(chunk, i, aff, zarr_path)
+                self.segment_chunk_wrapped(chunk, i, aff, patched_zarr_path)
         else:
             if self.compute_backend == "local_cluster":
                 from dask_cuda import LocalCUDACluster
@@ -289,34 +301,26 @@ class Postprocessing:
             print(f"Waiting for workers...")
             client.wait_for_workers(n_workers=1)
             print("Dask Client Dashboard:", client.dashboard_link)
-            tasks = [dask.delayed(self.segment_chunk_wrapped)(chunk, i, aff, zarr_path) for (i, chunk) in enumerate(chunks)]
+            tasks = [dask.delayed(self.segment_chunk_wrapped)(chunk, i, aff, patched_zarr_path) for (i, chunk) in enumerate(chunks)]
             futures = persist(tasks)
             progress(futures)  # progress bar
             compute(futures)
 
-    def get_xyz_end(self, chunk, aff_shape):
-        """
-        Returns the end indices of a chunk, that correspond either to the chunk size, or align with the size of the affinities.
-        """
-        x, y, z = chunk
-        x_end, y_end, z_end = (min(x + self.chunk_cube_size, aff_shape[1]),
-                               min(y + self.chunk_cube_size, aff_shape[2]),
-                               min(z + self.chunk_cube_size, aff_shape[3]))
-        return (x_end, y_end, z_end)
-
-    def agglomerate_fragments(self, chunks, reverse_chunks, zarr_path, aff_shape):
+    def agglomerate_fragments(self, chunks, reverse_chunks, patched_zarr_path, aff_shape):
         if self.compute_backend == "local":
             fragment_agglomeration = {}
             for i, chunk in enumerate(tqdm(chunks)):
-                chunk_agglomeration = self.agglomerate_chunk(chunk, reverse_chunks, zarr_path, aff_shape)
-                fragment_agglomeration.update(chunk_agglomeration)
+                chunk_agglomeration = self.agglomerate_chunk(chunk, reverse_chunks, patched_zarr_path, aff_shape)
+                for node, nbrs in chunk_agglomeration.items():
+                    for nbr in nbrs:
+                        fragment_agglomeration.setdefault(node, set()).add(nbr)
                 if len(fragment_agglomeration) > 10_000_000:
                     print("WARNING: fragment agglomeration too long, might cause problems!")
                     # TODO: solve this
 
             curr_id, fragment_agglomeration_flattened = self.flatten_agglomeration(fragment_agglomeration)
             print("MERGING CHUNKS FLATTENED AGGLOMERATION LENGTH", len(fragment_agglomeration_flattened))
-            fragment_agglomeration_flattened = self.add_all_fragments_to_agglomeration(fragment_agglomeration_flattened, curr_id, chunks, zarr_path)
+            fragment_agglomeration_flattened = self.add_all_fragments_to_agglomeration(fragment_agglomeration_flattened, curr_id, chunks, patched_zarr_path)
             print("ALL CHUNKS FLATTENED AGGLOMERATION LENGTH", len(fragment_agglomeration_flattened))
 
         else:
@@ -325,18 +329,18 @@ class Postprocessing:
 
         return fragment_agglomeration_flattened
 
-    def agglomerate_chunk(self, chunk, reverse_chunks, zarr_path, aff_shape):
+    def agglomerate_chunk(self, chunk, reverse_chunks, patched_zarr_path, aff_shape):
         fragment_agglomeration = {}
         x, y, z = chunk
-        x_end, y_end, z_end = self.get_xyz_end(chunk, aff_shape)
-        z_root = zarr.open(zarr_path, mode='r')
+        x_end, y_end, z_end = Utils.get_xyz_end(chunk, self.chunk_cube_size, aff_shape)
+        z_root = zarr.open(patched_zarr_path, mode='r')
 
         # for (x,y,z) get the last slice of the current cube (l, low) and the first slice of the next cube (h, high)
         # these slices overlap, so the voxels should have the same global id
 
         if x_end < aff_shape[1]:
             chunk_l = reverse_chunks[chunk]
-            chunk_h = reverse_chunks[x + self.chunk_cube_size, y, z]
+            chunk_h = reverse_chunks[x + self.chunk_cube_size - 1, y, z]
             result_l = z_root[chunk_l, -1:, :, :]
             result_h = z_root[chunk_h, :1, :, :]
             combined = np.stack([result_l.flatten(), result_h.flatten()]).T
@@ -345,7 +349,7 @@ class Postprocessing:
 
         if y_end < aff_shape[2]:
             chunk_l = reverse_chunks[chunk]
-            chunk_h = reverse_chunks[x, y + self.chunk_cube_size, z]
+            chunk_h = reverse_chunks[x, y + self.chunk_cube_size - 1, z]
             result_l = z_root[chunk_l, :, -1:, :]
             result_h = z_root[chunk_h, :, :1, :]
             combined = np.stack([result_l.flatten(), result_h.flatten()]).T
@@ -354,7 +358,7 @@ class Postprocessing:
 
         if z_end < aff_shape[3]:
             chunk_l = reverse_chunks[chunk]
-            chunk_h = reverse_chunks[x, y, z + self.chunk_cube_size]
+            chunk_h = reverse_chunks[x, y, z + self.chunk_cube_size - 1]
             result_l = z_root[chunk_l, :, :, -1:]
             result_h = z_root[chunk_h, :, :, :1]
             combined = np.stack([result_l.flatten(), result_h.flatten()]).T
@@ -401,8 +405,8 @@ class Postprocessing:
 
         return cur_id, fragment_agglomeration_flattened
 
-    def add_all_fragments_to_agglomeration(self, fragment_agglomeration_flattened, cur_id, chunks, zarr_path):
-        z_root = zarr.open(zarr_path)
+    def add_all_fragments_to_agglomeration(self, fragment_agglomeration_flattened, cur_id, chunks, patched_zarr_path):
+        z_root = zarr.open(patched_zarr_path)
         for i, chunk in enumerate(tqdm(chunks)):
             data = z_root[i, :, :, :]
             for idx in range(1, int(data.max()) + 1):  # assuming each chunk has contiguous indices from 0 to max
@@ -421,8 +425,8 @@ class Postprocessing:
         if self.compute_backend == "local":
             for i, chunk in enumerate(tqdm(chunks)):
                 x, y, z = chunk
-                x_end, y_end, z_end = self.get_xyz_end(chunk, aff_shape)
-                data = z_root[i, :x_end, :y_end, :z_end]
+                x_end, y_end, z_end = Utils.get_xyz_end(chunk, self.chunk_cube_size, aff_shape)
+                data = z_root[i, : x_end - x, : y_end - y, : z_end - z]
                 perm = [0]
                 for idx in range(1, int(data.max()) + 1):  # assuming each chunk has contiguous indices from 0 to max
                     assert (i, idx) in fragment_agglomeration  # all fragments have a new index (contiguous from 0)
@@ -438,11 +442,11 @@ class Postprocessing:
 
     def segment_chunk_wrapped(self, chunk, i, aff, zarr_path):
         x, y, z = chunk
-        x_end, y_end, z_end = self.get_xyz_end(chunk, aff.shape)
+        x_end, y_end, z_end = Utils.get_xyz_end(chunk, self.chunk_cube_size, aff.shape)
         curr_aff = aff[:, x : x_end, y : y_end, z : z_end]
         curr_seg = self.segment_chunk(curr_aff)
-        with zarr.open(zarr_path, mode="w") as z_root:
-            z_root[i, : x_end - x, : y_end - y, : z_end - z] = curr_seg
+        z_root = zarr.open(zarr_path, mode="r+")
+        z_root[i, : x_end - x, : y_end - y, : z_end - z] = curr_seg
 
     def segment_chunk(self, curr_aff):
         """

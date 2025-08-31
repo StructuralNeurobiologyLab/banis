@@ -177,11 +177,8 @@ def predict_aff(
                      chunks=(1, zarr_chunk_size, zarr_chunk_size, zarr_chunk_size), dtype='f4')
 
     if compute_backend == "local":
-        if not model:
-            from BANIS import BANIS
-            model = BANIS.load_from_checkpoint(model_path)
         for chunk in tqdm(chunked_patch_coordinates):
-            predict_aff_patches_chunked(chunk, img, model, zarr_path + "_tmp", small_size, do_overlap, prediction_channels, divide)
+            predict_aff_patches_chunked(chunk, img, model_path, zarr_path + "_tmp", small_size, do_overlap, prediction_channels, divide)
             torch.cuda.empty_cache() # TODO: does this help?
     else:
         if compute_backend == "local_cluster":
@@ -314,7 +311,7 @@ def predict_aff_patches_chunked(patch_coordinates, img, model_path, zarr_path, s
     single_pred_weight = get_single_pred_weight(do_overlap, small_size)
 
     from BANIS import BANIS
-    print(model_path, flush=True)
+    print(f"model path: {model_path}", flush=True)
     model = BANIS.load_from_checkpoint(model_path)
 
     for x_global, y_global, z_global in patch_coordinates:
@@ -467,7 +464,7 @@ def thresholding(aff, thr, zarr_path, chunk_cube_size, compute_backend):
         for i, chunk in enumerate(tqdm(chunks)):
             x, y, z = chunk
             x_end, y_end, z_end = min(x + chunk_cube_size, aff.shape[1]), min(y + chunk_cube_size, aff.shape[2]), min(z + chunk_cube_size, aff.shape[3])
-            data = z_root["instances_patched"][i, :x_end, :y_end, :z_end]
+            data = z_root["instances_patched"][i, : x_end - x, : y_end - y, : z_end - z]
             perm = [0]
             for idx in range(1, int(data.max()) + 1):  # assuming each chunk has contiguous indices from 0 to max
                 assert (i, idx) in fragment_agglomeration_flattened  # all fragments have a new index (congiguous from 0)
