@@ -38,6 +38,18 @@ python slurm_job_scheduler.py
 
 Adding an `auto_resubmit` argument to `config.yaml` allows Slurm to automatically resubmit jobs that reach the Slurm time limit (see `aff_train.sh`).
 
+## Prediction
+
+To predict segmentation from an image:
+
+```bash
+python inference --img_path /path/to/image.zarr --model_path /path/to/model.ckpt --chunk_cube_size 3000
+```
+
+The `chunk_cube_size` parameter sets the maximum cube size that can be loaded in memory.
+If you have enough memory available, set it to a bigger value, if you are tight with memory, set a lower value (in exchange for increased computation time).
+See [inference.py](inference.py) for other parameters.
+
 ## Evaluation
 
 To evaluate a predicted segmentation (`.zarr` or `.npy`):
