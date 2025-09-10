@@ -286,7 +286,6 @@ def evaluate_skeletons(
         return skeleton_scores
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute segmentation quality metrics.")
     parser.add_argument("--pred_seg", type=str, required=True, help="Path to predicted segmentation (Zarr format)")

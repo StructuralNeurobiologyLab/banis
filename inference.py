@@ -13,12 +13,10 @@ import zarr
 import dask
 from dask import compute, persist, delayed
 from dask.distributed import Client, LocalCluster
-from dask.diagnostics import ProgressBar
 import dask.array as da
 from distributed import progress
 from filelock import FileLock
 from numba import jit
-from numpy.f2py.crackfortran import updatevars
 from scipy.ndimage import distance_transform_cdt
 from torch import autocast
 from torch.nn.functional import sigmoid
