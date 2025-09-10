@@ -1,13 +1,13 @@
 import argparse
 import gc
 import os
+import shutil
+
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict
-import random
 
-import numpy as np
 import pytorch_lightning as pl
 import torch
 import torchvision
@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data import load_data
-from inference import scale_sigmoid, compute_connected_component_segmentation, predict_aff
+from inference import AffinityPredictor, Thresholding
 from metrics import compute_metrics
 
 
@@ -35,7 +35,7 @@ class BANIS(LightningModule):
     def __init__(self, **kwargs: Any):
         super().__init__()
         self.save_hyperparameters()
-        print(f"hparams: \n{self.hparams}")
+        # print(f"hparams: \n{self.hparams}")
 
         self.model = create_mednext_v1(
             num_input_channels=self.hparams.num_input_channels,
@@ -163,8 +163,17 @@ class BANIS(LightningModule):
 
         img_data = zarr.open(os.path.join(seed_path, "data.zarr"), mode="r")["img"]
 
-        aff_pred = predict_aff(img_data, model=self, zarr_path=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr", do_overlap=True, prediction_channels=3, divide=255,
-                                     small_size=self.hparams.small_size, compute_backend="local")
+        affinity_predictor = AffinityPredictor(
+            chunk_cube_size=3000,  # can be adjusted
+            compute_backend="local",
+            model=self,
+            small_size=self.hparams.small_size,
+            do_overlap=True,
+            prediction_channels=3,
+            divide=255,
+        )
+        affinity_predictor.img_to_aff(img_data, zarr_path=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr")
+        aff_pred = zarr.open(f"{self.hparams.save_dir}/pred_aff_{mode}.zarr", mode="r")
 
         self._evaluate_thresholds(aff_pred, os.path.join(seed_path, "skeleton.pkl"), mode, global_step)
 
@@ -179,9 +188,9 @@ class BANIS(LightningModule):
             torch.cuda.empty_cache()
             print(f"threshold {thr}")
 
-            pred_seg = compute_connected_component_segmentation(
-                aff_pred[:3] > thr  # hard affinities
-            )
+            postprocessor = Thresholding(3000, "local", thr)
+            postprocessor.aff_to_seg(aff_pred, f"{self.hparams.save_dir}/pred_seg_{mode}_tmp.zarr")
+            pred_seg = zarr.open(f"{self.hparams.save_dir}/pred_seg_{mode}_tmp.zarr", mode="r")
 
             metrics = compute_metrics(pred_seg, skel_path)
 
@@ -201,9 +210,11 @@ class BANIS(LightningModule):
                     self.best_thr_so_far[mode] = thr
                     with open(f"{self.hparams.save_dir}/best_thr_{mode}.txt", "w") as f:
                         f.write(str(self.best_thr_so_far[mode]))
-                    seg_pred = zarr.array(pred_seg, dtype=np.uint32,
-                                          store=f"{self.hparams.save_dir}/pred_seg_{mode}.zarr",
-                                          chunks=(512, 512, 512), overwrite=True)
+                    if os.path.exists(f"{self.hparams.save_dir}/pred_seg_{mode}.zarr"):
+                        shutil.rmtree(f"{self.hparams.save_dir}/pred_seg_{mode}.zarr")
+                    os.replace(f"{self.hparams.save_dir}/pred_seg_{mode}_tmp.zarr", f"{self.hparams.save_dir}/pred_seg_{mode}.zarr")
+            else:
+                shutil.rmtree(f"{self.hparams.save_dir}/pred_seg_{mode}_tmp.zarr")
             best_voi = min(best_voi, metrics["voi_sum"])
 
         self.safe_add_scalar(f"{mode}_best_nerl", best_nerl, global_step)
@@ -266,9 +277,9 @@ class BANIS(LightningModule):
         self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
 
         total_norm_after = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("clipped_gradients/total_norm", total_norm_after.item(), on_step=True)
+        self.log("gradients/total_norm_clipped", total_norm_after.item(), on_step=True)
         max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("clipped_gradients/max_grad", max_grad_after)
+        self.log("gradients/max_grad_clipped", max_grad_after)
 
 
 def main():
