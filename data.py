@@ -336,7 +336,7 @@ def get_seg_dataset(
 
     datasets = []
     for name in tqdm(names, desc="Loading datasets"):
-        sample = zarr.open(os.path.join(data_path, name), "r")
+        sample = zarr.open(os.path.join(data_path, name), mode="r")
         seg = sample["/volumes/labels/neuron_ids"][:]
         img = sample["/volumes/raw"][:][:, :, :, None]
 
@@ -401,7 +401,7 @@ def get_syn_train_data(args: argparse.Namespace):
         for seed_train_path in seeds_train_paths
     ])
     print(f"image+segmentation paths: {img_seg_paths}")
-    img_segs_train = [zarr.open(path, "r") for path in img_seg_paths]
+    img_segs_train = [zarr.open(path, mode="r") for path in img_seg_paths]
     segs_train = [img_seg["seg"] for img_seg in img_segs_train]
     print(f"Segmentation shapes: {[seg.shape for seg in segs_train]}")
 
@@ -432,7 +432,7 @@ def get_val_data(args: argparse.Namespace):
     seeds_val_paths = [os.path.join(base_path_val, seed) for seed in seeds_path_val]
 
     img_seg_path = os.path.join(seeds_val_paths[0], "data.zarr")
-    img_seg = zarr.open(img_seg_path, "r")
+    img_seg = zarr.open(img_seg_path, mode="r")
 
     return AffinityDataset(
         seg=img_seg["seg"],
