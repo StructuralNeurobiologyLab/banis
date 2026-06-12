@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data import load_data
-from inference import scale_sigmoid, predict_aff, compute_connected_component_segmentation
+from inference import scale_sigmoid, patched_inference, compute_connected_component_segmentation
 from metrics import compute_metrics
 
 
@@ -135,14 +135,18 @@ class BANIS(LightningModule):
                 os.system(command)
                 print(f"running validation: {command}")
 
-        else:
-            self.full_cube_inference("val")
+        # Paper protocol: the expensive full-cube validation runs ONCE, at the end
+        # of training (in on_train_end below), not every val_check_interval. The
+        # external-SLURM validation path above (validate_extern) is unaffected.
+        # else:
+        #     self.full_cube_inference("val")
 
     def on_train_end(self):
-        assert self.best_nerl_so_far["val"] > 0, "No best NERL found in validation"
         self.eval()
         print(f"device {next(self.parameters()).device}")
         self.cuda()
+        self.full_cube_inference("val")  # calibrate the best threshold on the final weights
+        assert self.best_nerl_so_far["val"] > 0, "No best NERL found in validation"
         self.full_cube_inference("test")
         self.full_cube_inference("train")
 
@@ -163,8 +167,11 @@ class BANIS(LightningModule):
 
         img_data = zarr.open(os.path.join(seed_path, "data.zarr"), mode="r")["img"]
 
-        aff_pred = predict_aff(img_data, model=self, zarr_path=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr", do_overlap=True, prediction_channels=3, divide=255,
-                                     small_size=self.hparams.small_size, compute_backend="local")
+        aff_pred = patched_inference(img_data, model=self, do_overlap=True, prediction_channels=3, divide=255,
+                                     small_size=self.hparams.small_size)
+
+        aff_pred = zarr.array(aff_pred, dtype=np.float16, store=f"{self.hparams.save_dir}/pred_aff_{mode}.zarr",
+                              chunks=(3, 512, 512, 512), overwrite=True)
 
         self._evaluate_thresholds(aff_pred, os.path.join(seed_path, "skeleton.pkl"), mode, global_step)
 
@@ -257,18 +264,8 @@ class BANIS(LightningModule):
                 f"weights/{name}_std": param.data.std(),
             })
 
-    def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm):
-        total_norm_before = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("gradients/total_norm", total_norm_before.item())
-        max_grad_before = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("gradients/max_grad", max_grad_before)
-
-        self.clip_gradients(optimizer, gradient_clip_val=gradient_clip_val, gradient_clip_algorithm=gradient_clip_algorithm)
-
-        total_norm_after = torch.norm(torch.stack([p.grad.norm(2) for p in self.parameters() if p.grad is not None]))
-        self.log("gradients/total_norm_clipped", total_norm_after.item(), on_step=True)
-        max_grad_after = max([p.grad.abs().max().item() for p in self.parameters() if p.grad is not None])
-        self.log("gradients/max_grad_clipped", max_grad_after)
+    # Gradient clipping is handled natively by the Trainer via --gradient_clip_val
+    # (default 0.0 = off, as in the paper). No custom override needed.
 
 
 def main():
@@ -326,7 +323,7 @@ def main():
         val_check_interval=args.val_check_interval,  # validation full cube inference expensive so less frequent
         check_val_every_n_epoch=None,
         num_sanity_val_steps=args.n_debug_steps,
-        gradient_clip_val=1.0,
+        gradient_clip_val=args.gradient_clip_val,  # 0.0 = no clipping (paper default)
     )
     print(f"Checkpoints will be saved in: {trainer.default_root_dir}/checkpoints")
 
@@ -363,7 +360,8 @@ def parse_args():
     # Training arguments
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
-    parser.add_argument("--n_steps", type=int, default=20_000, help="Number of training steps.")
+    parser.add_argument("--n_steps", type=int, default=50_000, help="Number of training steps.")
+    parser.add_argument("--gradient_clip_val", type=float, default=0.0, help="Gradient clipping value (0.0 = off, paper default).")
     parser.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for the optimizer.")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay for the optimizer.")
     parser.add_argument("--workers", type=int, default=8, help="Number of workers for data loading.")
